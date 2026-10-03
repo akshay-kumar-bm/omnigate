@@ -24,6 +24,9 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 - Supporting: `list_environments`, `list_folders`, `list_secrets`, `get_secret`, `add_secret`, `update_secret`,
   `delete_secret` (needs `confirm: true`). These never return secret values.
 
+**Folders:** secrets live in one Infisical folder per service (`/notion`, `/github`, `/linear`, `/tavily`, `/firecrawl`).
+`api_request` finds a secret by name in any folder (error if the name exists in several; pass `path`).
+
 **Host binding (deny by default):** a secret can only be sent to the hosts in its own comment, a `hosts: a.com, *.b.com`
 line, written by `add_secret`'s `hosts` argument and locked afterwards (`update_secret` preserves it and strips any
 `hosts:` in new comment text). No built-in list, no config var; no `hosts:` line means never sent. Wildcards need 2

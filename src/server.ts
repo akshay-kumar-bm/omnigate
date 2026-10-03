@@ -29,6 +29,7 @@ const INSTRUCTIONS = [
   "Universal API: make authenticated calls to any HTTPS API or integration (GitHub, Jira, Notion, Stripe, Slack, AWS, ...) without ever seeing the credentials.",
   "Use api_request for the call itself: pass the secret NAME plus the URL, method and body; the server adds the token and returns the response with the token redacted.",
   "Use list_secrets to see which credentials exist (names, approved hosts; never values) and add_secret to store a new one. A secret can only be sent to the hosts in its own comment (a 'hosts: ...' line, shown as approved_hosts). When you store a token with add_secret you MUST pass hosts, the API's hostnames, e.g. [\"api.linear.app\"] or [\"*.atlassian.net\"] (no scheme or path); look up the service's API host if you are unsure. Hosts are fixed when the secret is created and cannot be changed through this server, so get them right the first time; only the owner can change them later. If api_request says a host is not allowed, tell the user.",
+  "Secrets are organised in one folder per service (e.g. /notion/NOTION_TOKEN). api_request finds a secret by name in any folder; pass path only if the same name exists in several. When you add a token, put it in its own folder with path (e.g. /linear).",
   "Never ask the user to paste a token into the chat if it can be stored with add_secret, and never try to read secret values back.",
 ].join("\n");
 
@@ -89,6 +90,7 @@ export function createServer(env: Env) {
           aws_secret_key_secret: secretName.optional().describe("default AWS_SECRET_ACCESS_KEY"),
           aws_session_token_secret: secretName.optional().describe("default AWS_SESSION_TOKEN"),
           ...loc,
+          path: z.string().optional().describe("Folder of the secret, e.g. /notion. If omitted, the secret is found by name in any folder (an error if the name exists in several)."),
         }),
       },
       async (a) => {
@@ -114,7 +116,7 @@ export function createServer(env: Env) {
 
     server.registerTool(
       "list_secrets",
-      { description: "List the credentials available to api_request: names, comments and the hosts each may be sent to. Values are never returned.", inputSchema: z.object({ ...loc, recursive: z.boolean().default(false) }) },
+      { description: "List the credentials available to api_request: names, folders, comments and the hosts each may be sent to. Values are never returned. Searches all folders by default.", inputSchema: z.object({ ...loc, recursive: z.boolean().default(true) }) },
       async (a) => {
         try {
           const b = base(a);

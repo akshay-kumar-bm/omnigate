@@ -76,6 +76,13 @@ export const infisical = {
     if (typeof v !== "string" || v === "") throw new Error(`Secret ${name} has no readable value`);
     return { value: v, comment: String(r.secret.secretComment ?? "") };
   },
+  // Folders of every secret with this exact name (value never requested). Used when a caller omits the path.
+  findSecretPaths: async (env: InfisicalEnv, name: string, q: { projectId: string; environment: string }): Promise<string[]> => {
+    const r = await call(env, "GET", "/api/v4/secrets", {
+      query: { ...q, secretPath: "/", recursive: "true", viewSecretValue: "false", expandSecretReferences: "false", includeImports: "false" },
+    });
+    return (r.secrets ?? []).filter((x: any) => x.secretKey === name).map((x: any) => String(x.secretPath ?? "/"));
+  },
   createSecret: (env: InfisicalEnv, name: string, body: Record<string, unknown>) =>
     call(env, "POST", `/api/v4/secrets/${encodeURIComponent(name)}`, { body: { type: "shared", ...body } }),
   updateSecret: (env: InfisicalEnv, name: string, body: Record<string, unknown>) =>

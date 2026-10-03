@@ -76,10 +76,18 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
 
   const method = (a.method ?? "GET").toUpperCase();
   const authType = a.auth_type ?? "bearer";
-  const loc = { projectId: env.INFISICAL_PROJECT_ID, environment: a.environment ?? env.DEFAULT_ENVIRONMENT, secretPath: a.path ?? "/" };
+  const scope = { projectId: env.INFISICAL_PROJECT_ID, environment: a.environment ?? env.DEFAULT_ENVIRONMENT };
   const used: string[] = []; // secret values, for redaction
   const read = async (name: string) => {
-    const secret = await infisical.getSecretValue(env, name, loc);
+    // No path given: find the secret by name in any folder, but never guess between several.
+    let secretPath = a.path;
+    if (secretPath === undefined) {
+      const paths = await infisical.findSecretPaths(env, name, scope);
+      if (paths.length === 0) throw new Error(`Secret ${name} not found in environment ${scope.environment}`);
+      if (paths.length > 1) throw new Error(`Secret ${name} exists in several folders (${paths.join(", ")}); pass path to choose one`);
+      secretPath = paths[0];
+    }
+    const secret = await infisical.getSecretValue(env, name, { ...scope, secretPath });
     const approved = approvedHosts(secret.comment);
     if (!hostAllowed(url.hostname, approved)) {
       throw new Error(

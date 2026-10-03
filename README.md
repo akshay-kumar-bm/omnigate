@@ -34,7 +34,7 @@ S3: `PUT https://<bucket>.s3.<region>.amazonaws.com/<key>` with `auth_type: aws_
   - To connect a new service: `add_secret` its token with `hosts` (e.g. `["api.linear.app"]`). No redeploy.
 - Secret references (`${OTHER}`) are not expanded when `api_request` reads a value, so a secret can't be used to leak another secret.
 - HTTPS only, default port only, redirects are not followed, 25 s timeout, response body capped at 60 KB, uploads capped at 5 MB, secrets redacted from the body and headers. The client may not set its own `Authorization` header.
-- Secrets are read from `DEFAULT_ENVIRONMENT` (`dev`) unless `environment`/`path` is passed.
+- Secrets are read from `DEFAULT_ENVIRONMENT` (`dev`) unless `environment` is passed. Keep one Infisical folder per service (`/notion`, `/github`, ...): `api_request` finds a secret by name in any folder, refuses to guess if the same name is in several (pass `path`), and `list_secrets` searches all folders by default. `add_secret` takes `path` to choose the folder.
 - This is not a shell: it cannot run CLIs like `aws` or `gh`. For those, use `infisical run --env=dev -- <cmd>` in a session that has the Infisical CLI.
 
 ## Deploy
