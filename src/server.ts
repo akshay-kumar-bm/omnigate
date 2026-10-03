@@ -4,7 +4,7 @@ import { infisical, redact } from "./infisical";
 import { approvedHosts, callApi } from "./api-call";
 import { checkApproval, requestApproval, type ApprovalSpec } from "./approvals";
 import { agentConfigured, mintAgentToken } from "./temp-token";
-import { fullGuide, guide, usage, type Topic } from "./guide";
+import { fullGuide, guide, usage, type Topic, type Use } from "./guide";
 import { destructiveReason } from "./destructive";
 import { buildComment, commentHosts } from "./hosts";
 
@@ -258,12 +258,13 @@ export function createServer(env: Env) {
         description:
           "Get a short-lived Infisical access token so a CLI such as aws or terraform can read secrets (via `infisical run`). ALWAYS needs the user's approval with a 'give token' checkbox they must tick: the first call returns approval_required and a link; after they approve, repeat the identical call to receive the token and the commands to use it. " +
           "The token belongs to a limited 'agent' identity configured by the owner (not this server's own identity) and expires on its own. Treat it as a secret: never print it, store it or send it anywhere. If the agent identity is not set up yet, this returns the setup steps instead. " +
-          "use: aws_cli (run the AWS CLI), infisical_run (any command), rest_api (call the Infisical API).",
+          "use: git_clone (clone private repos with the stored GITHUB_TOKEN), github_cli (gh), aws_cli, infisical_run (any other command), rest_api (call the Infisical API). The response has the exact `infisical run` command to run, with the secrets of `path` injected into that one command.",
         inputSchema: z.object({
           purpose: z.string().min(5).max(200).describe("Why you need the token, in a sentence. The user sees this."),
-          use: z.enum(["aws_cli", "infisical_run", "rest_api"]).default("aws_cli"),
+          use: z.enum(["aws_cli", "git_clone", "github_cli", "infisical_run", "rest_api"]).default("aws_cli"),
           environment: z.string().optional().describe("Environment you will read (default from config, e.g. dev)"),
-          path: z.string().optional().describe("Folder you will read, e.g. /aws (default /)"),
+          path: z.string().optional().describe("Folder holding the secrets the command needs, e.g. /github or /aws. Default: /github for git_clone and github_cli, /aws for aws_cli, otherwise /."),
+          command: z.string().max(300).optional().describe("The command you plan to run (shown to the user and put into the returned commands). The approval is for the token, not for this command."),
           ...approvalField,
         }),
       },
@@ -277,7 +278,7 @@ export function createServer(env: Env) {
             });
           }
           const environment = a.environment ?? env.DEFAULT_ENVIRONMENT;
-          const path = a.path ?? "/";
+          const path = a.path ?? ({ aws_cli: "/aws", git_clone: "/github", github_cli: "/github" } as Record<string, string>)[a.use] ?? "/";
           // A token handed to an assistant must be short-lived. Its lifetime is set on the agent identity in Infisical, so log in
           // once up front (the probe token is thrown away, never shown) to learn it, refuse if it is too long, and show it to the human.
           const maxSeconds = Number(env.AGENT_TOKEN_MAX_SECONDS) > 0 ? Number(env.AGENT_TOKEN_MAX_SECONDS) : MAX_TOKEN_SECONDS_DEFAULT;
@@ -291,12 +292,12 @@ export function createServer(env: Env) {
             if (!(probe.expiresIn > 0) || probe.expiresIn > maxSeconds) return ok(tooLong(probe.expiresIn));
             lifetime = `${duration(probe.expiresIn)}, then it stops working`;
           }
-          const useLabel = { aws_cli: "Running the AWS CLI", infisical_run: "Running a command with `infisical run`", rest_api: "Calling the Infisical API" }[a.use];
+          const useLabel = { aws_cli: "Running the AWS CLI", git_clone: "Cloning repositories with git", github_cli: "Running the GitHub CLI", infisical_run: "Running a command with `infisical run`", rest_api: "Calling the Infisical API" }[a.use];
           const held = await gate("issue_temp_token", a, {
             title: "Give the assistant a temporary Infisical token",
             risk: "token",
             rows: [
-              ["Purpose", a.purpose], ["Will be used for", useLabel], ["Project", env.INFISICAL_PROJECT_ID], ["Environment", environment], ["Folder", path],
+              ["Purpose", a.purpose], ["Will be used for", useLabel], ...(a.command ? [["Command", a.command] as [string, string]] : []), ["Project", env.INFISICAL_PROJECT_ID], ["Environment", environment], ["Folder", path],
               ["Identity", `agent identity (client id ending ${String(env.AGENT_INFISICAL_CLIENT_ID).slice(-6)})`],
               ["Lifetime", lifetime],
               ["Access", "Whatever that identity is allowed to read in Infisical. The folder above is only where the assistant plans to look; it is not a limit."],
@@ -316,7 +317,7 @@ export function createServer(env: Env) {
             project_id: env.INFISICAL_PROJECT_ID,
             environment,
             path,
-            how_to_use: usage({ use: a.use, host: env.INFISICAL_HOST, projectId: env.INFISICAL_PROJECT_ID, environment, path }),
+            how_to_use: usage({ use: a.use as Use, host: env.INFISICAL_HOST, projectId: env.INFISICAL_PROJECT_ID, environment, path, command: a.command }),
             reminder: "This is a secret. Do not print it, write it to a file, commit it or send it anywhere. It stops working when it expires.",
           });
         } catch (e) { return fail(e); }
