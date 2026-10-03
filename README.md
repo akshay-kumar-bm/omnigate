@@ -1,4 +1,6 @@
-# Universal API MCP server (infisical-mcp)
+# universal-api-mcp
+
+Universal API MCP server. (The Cloudflare Worker is still named `infisical-mcp`, so its URL and the Google redirect URI are unchanged.)
 
 One MCP server that lets Claude call **any HTTPS API or integration** (GitHub, Jira, Notion, Stripe, Slack, AWS, ...) with credentials kept in Infisical, so the model never sees a token. Runs on Cloudflare Workers (free plan) behind Google sign-in.
 

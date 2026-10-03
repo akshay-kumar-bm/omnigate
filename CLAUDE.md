@@ -1,0 +1,53 @@
+# universal-api-mcp
+
+Remote MCP server (Cloudflare Worker, TypeScript) that lets Claude call **any HTTPS API or integration**
+(GitHub, Jira, Notion, Stripe, AWS, ...) using credentials kept in Infisical. The model passes a secret
+**name**; the Worker reads the value, adds the auth, calls the API and returns the response with the secret
+redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALLOWED_EMAILS`.
+
+- Repo: `shipengineai/universal-api-mcp` (formerly `infisical-mcp`). The Worker is still named `infisical-mcp`.
+- Live URL: `https://infisical-mcp.shipengine-ai.workers.dev` (MCP endpoint: `/mcp`). Google redirect URI: `/callback`.
+- Infisical: US cloud (`https://us.infisical.com`), project id in `wrangler.jsonc`, default env `dev`.
+
+## Layout
+- `src/index.ts`: builds the MCP server, registers tools, wires the OAuth provider (`/mcp`, `/authorize`, `/token`, `/register`).
+- `src/api-call.ts`: the `api_request` logic (auth types, host check, uploads, redaction).
+- `src/infisical.ts`: thin Infisical REST client (Universal Auth). `getSecretValue` is server-side only.
+- `src/google-handler.ts`: Google sign-in, consent page, `/callback`. Bad OAuth params return 400, not a crash.
+- `wrangler.jsonc`: config vars and the KV binding. No separate config file.
+
+## Tools
+- **`api_request`** (main): authenticated HTTPS call. `auth_type`: bearer (default), header, basic, query,
+  aws_sigv4. Uploads: `multipart` or `body_base64` (5 MB cap). Redirects are not followed.
+- Supporting: `list_environments`, `list_folders`, `list_secrets`, `get_secret`, `add_secret`, `update_secret`,
+  `delete_secret` (needs `confirm: true`). These never return secret values.
+
+**Host binding:** a secret can only be sent to hosts listed for it in the `API_HOSTS` var in `wrangler.jsonc`
+(JSON, deny by default, `*.example.com` matches any depth). To add an integration: `add_secret` its token,
+add `"MY_TOKEN": ["api.example.com"]` to `API_HOSTS`, redeploy. Only the owner can change this.
+
+## Run
+```
+npm install --legacy-peer-deps      # flag required by this repo; deps are pinned, keep them pinned
+npm run dev                         # wrangler dev; needs .dev.vars (below)
+npm run deploy                      # wrangler deploy (needs CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID)
+```
+`.dev.vars` (git-ignored): `INFISICAL_CLIENT_ID`, `INFISICAL_CLIENT_SECRET`, `GOOGLE_CLIENT_ID`,
+`GOOGLE_CLIENT_SECRET`, `PUBLIC_URL=http://localhost:8787`. Production secrets are Worker secrets:
+`npx wrangler secret put <NAME>` (pipe the bare value in; no `NAME=` prefix or whitespace).
+
+## Test
+There is no test suite. Before pushing run `npm run typecheck`. To exercise `api_request` without OAuth, call
+`callApi` from `src/api-call.ts` in a throwaway script (e.g. `npx tsx x.mts`) using real Infisical credentials
+from the environment, and check status codes and redaction only. Check a deploy with:
+- `curl .../.well-known/oauth-authorization-server` returns 200.
+- `curl -i .../mcp` returns 401 with `WWW-Authenticate` (no token).
+- A bare `/authorize` or `/callback` returns 400 (expected; real clients send params).
+The full flow (Google sign-in, tools) can only be checked from a Claude client connected to `/mcp`.
+
+## Rules
+- Never print, log or commit secret values or tokens. Report lengths or status codes instead.
+- Do not return raw secret values to the MCP client; do not follow redirects in `api_request`.
+- Only the owner widens `API_HOSTS` or `ALLOWED_EMAILS`; do not do it unprompted.
+- Avoid renaming the Worker: that changes the URL and breaks the Google redirect URI and connectors.
+- Develop on the branch you are given; open a draft PR into `main`.
