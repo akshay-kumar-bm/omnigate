@@ -32,6 +32,9 @@ npm install --legacy-peer-deps      # flag required by this repo; deps are pinne
 npm run dev                         # wrangler dev; needs .dev.vars (below)
 npm run deploy                      # wrangler deploy (needs CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID)
 ```
+**Auto-deploy:** every push to `main` runs `.github/workflows/deploy.yml` (install, typecheck, `wrangler deploy`) using
+the repo secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`. Merging a PR therefore deploys it. The Worker's
+own secrets are not part of a deploy.
 `.dev.vars` (git-ignored): `INFISICAL_CLIENT_ID`, `INFISICAL_CLIENT_SECRET`, `GOOGLE_CLIENT_ID`,
 `GOOGLE_CLIENT_SECRET`, `PUBLIC_URL=http://localhost:8787`. Production secrets are Worker secrets:
 `npx wrangler secret put <NAME>` (pipe the bare value in; no `NAME=` prefix or whitespace).

@@ -33,6 +33,7 @@ S3: `PUT https://<bucket>.s3.<region>.amazonaws.com/<key>` with `auth_type: aws_
 - This is not a shell: it cannot run CLIs like `aws` or `gh`. For those, use `infisical run --env=dev -- <cmd>` in a session that has the Infisical CLI.
 
 ## Deploy
+Pushes to `main` deploy automatically via GitHub Actions (`.github/workflows/deploy.yml`; repo secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`). The steps below are the one-time setup and the manual route.
 1. `npm install --legacy-peer-deps`
 2. `npx wrangler login`
 3. `npx wrangler kv namespace create OAUTH_KV` -> put the id in `wrangler.jsonc`
