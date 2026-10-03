@@ -13,7 +13,7 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 - `src/index.ts`: wires the OAuth provider (`/mcp`, `/authorize`, `/token`, `/register`) around the MCP server.
 - `src/server.ts`: the MCP server and its tools (no Cloudflare-only imports, so it runs under Node for tests).
 - `src/api-call.ts`: the `api_request` logic (auth types, host check, uploads, redaction).
-- `src/default-hosts.ts`: built-in approved hosts, plus validation/parsing of the `hosts:` comment line.
+- `src/hosts.ts`: validation and parsing of the `hosts:` comment line.
 - `src/infisical.ts`: thin Infisical REST client (Universal Auth). `getSecretValue` is server-side only.
 - `src/google-handler.ts`: Google sign-in, consent page, `/callback`. Bad OAuth params return 400, not a crash.
 - `wrangler.jsonc`: config vars and the KV binding. No separate config file.
@@ -24,11 +24,11 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 - Supporting: `list_environments`, `list_folders`, `list_secrets`, `get_secret`, `add_secret`, `update_secret`,
   `delete_secret` (needs `confirm: true`). These never return secret values.
 
-**Host binding (deny by default):** a secret can only be sent to approved hosts: (1) built-in per well-known secret name
-(`src/default-hosts.ts`), (2) a `hosts: a.com, *.b.com` line in the secret's own comment, written by `add_secret`'s `hosts`
-argument and locked afterwards (`update_secret` preserves it and strips any `hosts:` in new comment text), (3) the
-`API_HOSTS` var in `wrangler.jsonc`, which wins over both (`"NAME": []` disables). Wildcards need 2 labels and are
-refused on shared-hosting domains. `${REF}` secret references are never expanded. Only the owner changes approvals.
+**Host binding (deny by default):** a secret can only be sent to the hosts in its own comment, a `hosts: a.com, *.b.com`
+line, written by `add_secret`'s `hosts` argument and locked afterwards (`update_secret` preserves it and strips any
+`hosts:` in new comment text). No built-in list, no config var; no `hosts:` line means never sent. Wildcards need 2
+labels and are refused on shared-hosting domains. `${REF}` secret references are never expanded. Only the owner
+(Infisical dashboard) changes hosts on an existing secret.
 
 ## Run
 ```
@@ -56,6 +56,6 @@ The full flow (Google sign-in, tools) can only be checked from a Claude client c
 ## Rules
 - Never print, log or commit secret values or tokens. Report lengths or status codes instead.
 - Do not return raw secret values to the MCP client; do not follow redirects in `api_request`.
-- Only the owner widens approved hosts (`API_HOSTS`, `default-hosts.ts`, a secret's `hosts:` comment) or `ALLOWED_EMAILS`; do not do it unprompted.
+- Only the owner widens a secret's `hosts:` comment or `ALLOWED_EMAILS`; do not do it unprompted.
 - Avoid renaming the Worker: that changes the URL and breaks the Google redirect URI and connectors.
 - Develop on the branch you are given; open a draft PR into `main`.

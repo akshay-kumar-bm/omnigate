@@ -10,9 +10,6 @@
     "INFISICAL_PROJECT_ID": "e550c9ba-7757-4c6f-a3c2-ca83e8ec20b3",
     "DEFAULT_ENVIRONMENT": "dev",
     "ALLOWED_EMAILS": "akshaykumarbedre.bm@gmail.com,shipengine.ai@gmail.com",
-    // Extra or overriding approved hosts for api_request, as JSON: {"MY_TOKEN":["api.example.com"],"JIRA_AUTH":["*.atlassian.net"]}.
-    // Well-known services (Notion, GitHub, Linear, Stripe, ...) are already approved in src/default-hosts.ts; "NAME":[] disables one.
-    "API_HOSTS": "{}",
     "PUBLIC_URL": "https://infisical-mcp.shipengine-ai.workers.dev"
   },
   "observability": { "enabled": true }

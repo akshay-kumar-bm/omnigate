@@ -1,47 +1,8 @@
-// Built-in approved hosts for well-known services, keyed by the conventional secret name.
-// A secret stored under one of these names can be sent to these hosts by api_request with no config.
-// The API_HOSTS var in wrangler.jsonc adds names not listed here, or overrides an entry:
-//   "STRIPE_API_KEY": []                      -> disable the built-in approval for that name
-//   "MY_TOKEN": ["api.example.com"]           -> approve a service not listed here
-//   "JIRA_AUTH": ["*.atlassian.net"]          -> "*." matches any subdomain depth, never the bare domain
-// Anything not listed here or in API_HOSTS is refused.
-const GITHUB = ["api.github.com", "uploads.github.com"];
-const ATLASSIAN = ["*.atlassian.net", "api.atlassian.com"];
-const AWS = ["*.amazonaws.com"];
-
-export const DEFAULT_API_HOSTS: Record<string, string[]> = {
-  NOTION_TOKEN: ["api.notion.com"],
-  GITHUB_TOKEN: GITHUB,
-  GH_TOKEN: GITHUB,
-  LINEAR_API_TOKEN: ["api.linear.app"],
-  LINEAR_API_KEY: ["api.linear.app"],
-  JIRA_AUTH: ATLASSIAN,
-  JIRA_API_TOKEN: ATLASSIAN,
-  ATLASSIAN_API_TOKEN: ATLASSIAN,
-  TAVILY_API_KEY: ["api.tavily.com"],
-  FIRECRAWL_API_KEY: ["api.firecrawl.dev"],
-  STRIPE_API_KEY: ["api.stripe.com", "files.stripe.com"],
-  STRIPE_SECRET_KEY: ["api.stripe.com", "files.stripe.com"],
-  SLACK_BOT_TOKEN: ["slack.com"],
-  DISCORD_BOT_TOKEN: ["discord.com"],
-  OPENAI_API_KEY: ["api.openai.com"],
-  ANTHROPIC_API_KEY: ["api.anthropic.com"],
-  SENDGRID_API_KEY: ["api.sendgrid.com"],
-  CLOUDFLARE_API_TOKEN: ["api.cloudflare.com"],
-  VERCEL_TOKEN: ["api.vercel.com"],
-  HUBSPOT_ACCESS_TOKEN: ["api.hubapi.com"],
-  AIRTABLE_API_KEY: ["api.airtable.com"],
-  AIRTABLE_TOKEN: ["api.airtable.com"],
-  AWS_ACCESS_KEY_ID: AWS,
-  AWS_SECRET_ACCESS_KEY: AWS,
-  AWS_SESSION_TOKEN: AWS,
-};
-
-// ---- Per-secret hosts stored in the secret's comment -------------------------------------------------
-// A secret's comment may contain a line `hosts: api.example.com, *.example.com`. add_secret writes it from
-// its `hosts` argument; update_secret keeps it unchanged and strips any `hosts:` line from new comment text,
-// so hosts are fixed when the secret is created and the model cannot widen them later. The owner can edit
-// the comment in the Infisical dashboard, or override per name with API_HOSTS.
+// Approved hosts live in each secret's own comment, as a line `hosts: api.example.com, *.example.com`.
+// add_secret writes it from its `hosts` argument; update_secret keeps it unchanged and strips any `hosts:` line
+// from new comment text, so hosts are fixed when the secret is created and the model cannot widen them later.
+// The owner can edit the comment in the Infisical dashboard. There is no other source of approvals:
+// a secret without a valid `hosts:` line is never sent anywhere.
 
 // Domains where anyone can register a subdomain and read the requests it receives, so a wildcard on them
 // would let an attacker-owned site collect tokens. Exact hosts on these are still allowed when named in full.
