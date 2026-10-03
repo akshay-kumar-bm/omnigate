@@ -36,7 +36,7 @@ Use a temporary token with "infisical run" instead (this is how it was tested he
 2. Ask the assistant for a token (issue_temp_token, use=aws_cli); you approve with the box ticked. Other uses: git_clone and github_cli (GITHUB_TOKEN from /github), infisical_run (anything else).
 3. Run, with the token it returns:
      export TOK='<token>'
-     infisical run --silent --token="$INFISICAL_TOKEN" --domain=<infisical-host> --projectId=<project-id> --env=dev --path=/aws -- aws sts get-caller-identity
+     infisical run --silent --domain=<infisical-host> --projectId=<project-id> --env=dev --path=/aws -- aws sts get-caller-identity
    "infisical run" puts the secrets into that one aws process only. Try "aws sts get-caller-identity" first, then your real command.
 Even better: an Infisical AWS IAM dynamic secret ("Temporary Credentials" mode, up to 12 hours) hands out short-lived AWS credentials instead of a stored key. Docs: https://infisical.com/docs/documentation/platform/dynamic-secrets/aws-iam (not tested here).`;
 
@@ -55,8 +55,8 @@ export const fullGuide = () => [OVERVIEW, AGENT_IDENTITY, AWS, PROXY].join("\n\n
 export type Use = "aws_cli" | "git_clone" | "github_cli" | "infisical_run" | "rest_api";
 
 export function usage(a: { use: Use; host: string; projectId: string; environment: string; path: string; command?: string }): string {
-  const pre = `1. Install once: npm install -g @infisical/cli\n2. Set the token once, in the environment (do not print it): export INFISICAL_TOKEN='<the token above>'\n   Reuse it for every command until it expires; do not ask for a new one each time.\n3. Run:`;
-  const run = (inner: string) => `infisical run --silent --token="$INFISICAL_TOKEN" --domain=${a.host} --projectId=${a.projectId} --env=${a.environment} --path=${a.path} -- ${inner}`;
+  const pre = `1. Install once: npm install -g @infisical/cli\n2. Save the token once (shell variables do not survive between separate commands, so use a private file; never print it):\n   umask 077; printf %s '<the token above>' > ~/.infisical-token\n   Reuse it until it expires; do not ask for a new one each time. Delete it when done: rm ~/.infisical-token\n3. Run (the CLI reads INFISICAL_TOKEN from the environment):`;
+  const run = (inner: string) => `INFISICAL_TOKEN="$(cat ~/.infisical-token)" infisical run --silent --domain=${a.host} --projectId=${a.projectId} --env=${a.environment} --path=${a.path} -- ${inner}`;
   // A command that uses $VARS must run inside sh -c '...' so that the inner shell, not yours, expands them.
   const wrap = (cmd: string) => (cmd.includes("$") && !/^sh -c /.test(cmd) ? `sh -c '${cmd}'` : cmd);
   const note = `\nSecrets from ${a.environment}${a.path} reach that one command only.`;
@@ -70,6 +70,6 @@ export function usage(a: { use: Use; host: string; projectId: string; environmen
     case "infisical_run":
       return `${pre}\n${run(wrap(a.command ?? "<your command>"))}${note}`;
     default:
-      return `curl -s -H "Authorization: Bearer $INFISICAL_TOKEN" "${a.host}/api/v4/secrets?projectId=${a.projectId}&environment=${a.environment}&secretPath=${a.path}"   # lists what the agent identity may read (values hidden)`;
+      return `curl -s -H "Authorization: Bearer $(cat ~/.infisical-token)" "${a.host}/api/v4/secrets?projectId=${a.projectId}&environment=${a.environment}&secretPath=${a.path}"   # lists what the agent identity may read (values hidden)`;
   }
 }
