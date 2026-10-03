@@ -3,10 +3,12 @@ import { z } from "zod";
 import { infisical, redact } from "./infisical";
 import { approvedHosts, callApi } from "./api-call";
 import { checkApproval, requestApproval } from "./approvals";
+import { destructiveReason } from "./destructive";
 import { buildComment, commentHosts } from "./hosts";
 
 export interface Env {
   OAUTH_KV: KVNamespace;
+  APPROVAL_STORE?: DurableObjectNamespace<import("./approval-store").ApprovalStore>; // absent only in local tests
   OAUTH_PROVIDER: any;
   // vars
   INFISICAL_HOST: string;
@@ -31,7 +33,7 @@ const INSTRUCTIONS = [
   "Use api_request for the call itself: pass the secret NAME plus the URL, method and body; the server adds the token and returns the response with the token redacted.",
   "Use list_secrets to see which credentials exist (names, approved hosts; never values) and add_secret to store a new one. A secret can only be sent to the hosts in its own comment (a 'hosts: ...' line, shown as approved_hosts). When you store a token with add_secret you MUST pass hosts, the API's hostnames, e.g. [\"api.linear.app\"] or [\"*.atlassian.net\"] (no scheme or path); look up the service's API host if you are unsure. Hosts are fixed when the secret is created and cannot be changed through this server, so get them right the first time; only the owner can change them later. If api_request says a host is not allowed, tell the user.",
   "Secrets are organised in one folder per service (e.g. /notion/NOTION_TOKEN). api_request finds a secret by name in any folder; pass path only if the same name exists in several. When you add a token, put it in its own folder with path (e.g. /linear).",
-  "Destructive actions always need the user's approval, enforced by the server: delete_secret, update_secret with a new value or name, and api_request with method DELETE. The first call returns approval_required with a link; give the link to the user, wait until they say they approved it, then repeat the identical call with approval_id. An approval works once, for that exact action, for 15 minutes. Never try to work around it.",
+  "Destructive actions always need the user's approval, enforced by the server: delete_secret, update_secret with a new value or name, and api_request for DELETE requests, GraphQL delete/archive-style mutations and bodies that set archived/trashed/deleted to true. The first call returns approval_required with a link; give the link to the user, wait until they say they approved it, then repeat the identical call with approval_id. An approval works once, for that exact action, for 15 minutes. Never try to work around it.",
   "Never ask the user to paste a token into the chat if it can be stored with add_secret, and never try to read secret values back.",
 ].join("\n");
 
@@ -77,7 +79,7 @@ export function createServer(env: Env) {
           "Pass the secret NAME (see list_secrets); the server reads the token, adds the auth, calls the API and returns the response with the token redacted. " +
           "A secret can only be sent to the hosts in its own comment (the hosts given to add_secret; see approved_hosts in list_secrets), otherwise the call is refused and the error lists the approved hosts. Redirects are not followed. " +
           "auth_type: bearer (default; Authorization: Bearer <secret>), header (header_name + optional header_prefix), basic (secret = 'user:pass', or username + secret as password), query (query_param), " +
-          "file uploads: body_base64 (raw bytes) or multipart (form with files), up to 5 MB; aws_sigv4 (signs with secrets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / optional AWS_SESSION_TOKEN; needs aws_service and aws_region). Do not send your own Authorization header. Method DELETE always needs the user's approval: the first call returns an approval link, and you repeat the call with approval_id once they approve.",
+          "file uploads: body_base64 (raw bytes) or multipart (form with files), up to 5 MB; aws_sigv4 (signs with secrets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / optional AWS_SESSION_TOKEN; needs aws_service and aws_region). Do not send your own Authorization header. Destructive requests always need the user's approval: method DELETE, GraphQL mutations whose names contain delete/destroy/remove/archive/purge/trash, and bodies that set archived/trashed/deleted to true. The first call returns an approval link, and you repeat the call with approval_id once they approve.",
         inputSchema: z.object({
           url: z.string().url().describe("Full https:// URL"),
           method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]).default("GET"),
@@ -112,12 +114,13 @@ export function createServer(env: Env) {
       },
       async (a) => {
         try {
-          if (a.method === "DELETE") {
+          const why = destructiveReason(a.method, a.body);
+          if (why) {
             const preview = typeof a.body === "string" ? a.body : a.body !== undefined ? JSON.stringify(a.body) : "";
             const held = await gate("api_request", a, [
-              `DELETE ${a.url}`, `Credential: ${a.secret ?? "AWS keys"} (${a.auth_type})`,
+              `${a.method} ${a.url}`, `Why approval is needed: ${why}`, `Credential: ${a.secret ?? "AWS keys"} (${a.auth_type})`,
               ...(a.query ? [`Query: ${JSON.stringify(a.query)}`] : []),
-              ...(preview ? [`Body: ${preview.slice(0, 300)}${preview.length > 300 ? "..." : ""}`] : []),
+              ...(preview ? [`Body: ${preview.slice(0, 400)}${preview.length > 400 ? "..." : ""}`] : []),
             ]);
             if (held) return held;
           }

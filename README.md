@@ -38,12 +38,18 @@ S3: `PUT https://<bucket>.s3.<region>.amazonaws.com/<key>` with `auth_type: aws_
 - This is not a shell: it cannot run CLIs like `aws` or `gh`. For those, use `infisical run --env=dev -- <cmd>` in a session that has the Infisical CLI.
 
 ## Approval for destructive actions
-These always need a human, enforced by the server (not by the model): `delete_secret`, `update_secret` with a new value or name, and `api_request` with method `DELETE`. Everything else (reads, creates, other writes, comment-only edits) runs automatically.
+These always need a human, enforced by the server (not by the model):
+- `delete_secret`, and `update_secret` with a new value or name.
+- `api_request` that is destructive: method `DELETE`; a GraphQL mutation whose field names contain delete/destroy/remove/archive/purge/trash (e.g. Linear `issueDelete`); or a JSON body that sets `archived`/`trashed`/`deleted`/`in_trash` to `true` (how Notion and GitHub archive).
+
+Everything else (reads, creates, other writes, comment-only edits) runs automatically.
 1. The first call returns `approval_required` with an `approve_url` and does nothing.
-2. The user opens the link, signs in with Google (an account in `ALLOWED_EMAILS`) and presses **Approve** (or **Deny**). A model can't do this: it needs the Google sign-in and a one-time nonce that only that browser receives.
+2. The user opens the link. The first time, it goes straight to Google sign-in (an account in `ALLOWED_EMAILS`); that leaves a 12-hour `HttpOnly` session cookie in their browser. After that, every approval link opens directly to a page showing the exact action with **Approve** and **Deny** buttons, so approving is one click. The page has a "Sign out of approvals" button. A model can't do this: it never has the cookie, and the confirm request needs both the cookie and a one-time nonce that was issued for that person and that approval.
 3. The model repeats the identical call with `approval_id`. The approval is bound to the exact tool and arguments (a different URL, name or body is refused), works once, and expires after 15 minutes.
 
-Limits: only the actions above are gated. A destructive call made with `POST`/`PATCH` (for example a GraphQL delete mutation or Notion `archived: true`) is not detected, and method-override headers are refused so they can't disguise a `DELETE`.
+Approval records, sign-in sessions and one-time nonces live in a **Durable Object** (`ApprovalStore`), not Workers KV: KV is only eventually consistent, so an approval made in one region could still read as "pending" in another for up to a minute. A Durable Object reads its own writes everywhere, so a retry right after you click Approve sees it.
+
+Limits: detection of non-`DELETE` destructive API calls is best effort (`src/destructive.ts`). It reads GraphQL field names (aliases can't hide them; string literals and comments are ignored) and archive-style flags, but a destructive operation that uses other wording or a persisted query id is not recognised. Method-override headers are refused so they can't disguise a `DELETE`.
 
 ## Deploy
 Pushes to `main` deploy automatically via GitHub Actions (`.github/workflows/deploy.yml`; repo secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`). The steps below are the one-time setup and the manual route.
