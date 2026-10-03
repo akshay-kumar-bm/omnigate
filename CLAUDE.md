@@ -28,7 +28,7 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 
 **Approvals:** `delete_secret`, `update_secret` (new value or name) and destructive `api_request` calls (DELETE, GraphQL
 delete/archive-style mutations, bodies setting archived/trashed/deleted true; see `src/destructive.ts`) need a human: the
-first call returns `approval_required` + a link (`src/approvals.ts`); the user signs in with Google and approves; the repeat
+first call returns `approval_required` + a link (`src/approvals.ts`); the user signs in with Google once (12 h session cookie), then each link is one click; the repeat
 call with `approval_id` runs once, only for the exact same arguments, within 15 minutes. Never bypass or weaken this.
 
 **Folders:** secrets live in one Infisical folder per service (`/notion`, `/github`, `/linear`, `/tavily`, `/firecrawl`).

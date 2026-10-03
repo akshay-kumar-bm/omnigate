@@ -44,7 +44,7 @@ These always need a human, enforced by the server (not by the model):
 
 Everything else (reads, creates, other writes, comment-only edits) runs automatically.
 1. The first call returns `approval_required` with an `approve_url` and does nothing.
-2. The user opens the link, signs in with Google (an account in `ALLOWED_EMAILS`) and presses **Approve** (or **Deny**). A model can't do this: it needs the Google sign-in and a one-time nonce that only that browser receives.
+2. The user opens the link. The first time, it goes straight to Google sign-in (an account in `ALLOWED_EMAILS`); that leaves a 12-hour `HttpOnly` session cookie in their browser. After that, every approval link opens directly to a page showing the exact action with **Approve** and **Deny** buttons, so approving is one click. The page has a "Sign out of approvals" button. A model can't do this: it never has the cookie, and the confirm request needs both the cookie and a one-time nonce that was issued for that person and that approval.
 3. The model repeats the identical call with `approval_id`. The approval is bound to the exact tool and arguments (a different URL, name or body is refused), works once, and expires after 15 minutes.
 
 Limits: detection of non-`DELETE` destructive API calls is best effort (`src/destructive.ts`). It reads GraphQL field names (aliases can't hide them; string literals and comments are ignored) and archive-style flags, but a destructive operation that uses other wording or a persisted query id is not recognised. Method-override headers are refused so they can't disguise a `DELETE`.
