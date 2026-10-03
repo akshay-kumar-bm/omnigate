@@ -13,6 +13,7 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 - `src/index.ts`: wires the OAuth provider (`/mcp`, `/authorize`, `/token`, `/register`) around the MCP server.
 - `src/server.ts`: the MCP server and its tools (no Cloudflare-only imports, so it runs under Node for tests).
 - `src/api-call.ts`: the `api_request` logic (auth types, host check, uploads, redaction).
+- `src/destructive.ts`: best-effort detection of destructive api_request calls beyond HTTP DELETE.
 - `src/approvals.ts`: approval records (KV), the `/approve/*` pages, and the approval Google sign-in via `/callback` (state `ap.*`).
 - `src/hosts.ts`: validation and parsing of the `hosts:` comment line.
 - `src/infisical.ts`: thin Infisical REST client (Universal Auth). `getSecretValue` is server-side only.
@@ -25,9 +26,10 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 - Supporting: `list_environments`, `list_folders`, `list_secrets`, `get_secret`, `add_secret`, `update_secret`,
   `delete_secret` (needs `confirm: true`). These never return secret values.
 
-**Approvals:** `delete_secret`, `update_secret` (new value or name) and `api_request` with `DELETE` need a human: the first call
-returns `approval_required` + a link (`src/approvals.ts`); the user signs in with Google and approves; the repeat call with
-`approval_id` runs once, only for the exact same arguments, within 15 minutes. Never bypass or weaken this.
+**Approvals:** `delete_secret`, `update_secret` (new value or name) and destructive `api_request` calls (DELETE, GraphQL
+delete/archive-style mutations, bodies setting archived/trashed/deleted true; see `src/destructive.ts`) need a human: the
+first call returns `approval_required` + a link (`src/approvals.ts`); the user signs in with Google and approves; the repeat
+call with `approval_id` runs once, only for the exact same arguments, within 15 minutes. Never bypass or weaken this.
 
 **Folders:** secrets live in one Infisical folder per service (`/notion`, `/github`, `/linear`, `/tavily`, `/firecrawl`).
 `api_request` finds a secret by name in any folder (error if the name exists in several; pass `path`).
