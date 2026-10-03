@@ -55,8 +55,8 @@ export const fullGuide = () => [OVERVIEW, AGENT_IDENTITY, AWS, PROXY].join("\n\n
 export type Use = "aws_cli" | "git_clone" | "github_cli" | "infisical_run" | "rest_api";
 
 export function usage(a: { use: Use; host: string; projectId: string; environment: string; path: string; command?: string }): string {
-  const pre = `1. Install once: npm install -g @infisical/cli\n2. Save the token once (shell variables do not survive between separate commands, so use a private file; never print it):\n   umask 077; printf %s '<the token above>' > ~/.infisical-token\n   Reuse it until it expires; do not ask for a new one each time. Delete it when done: rm ~/.infisical-token\n3. Run (the CLI reads INFISICAL_TOKEN from the environment):`;
-  const run = (inner: string) => `INFISICAL_TOKEN="$(cat ~/.infisical-token)" infisical run --silent --domain=${a.host} --projectId=${a.projectId} --env=${a.environment} --path=${a.path} -- ${inner}`;
+  const pre = `1. Install once: npm install -g @infisical/cli\n2. Set it as a global environment variable once (never print it): echo "export INFISICAL_TOKEN='<the token above>'" >> ~/.bashrc && export INFISICAL_TOKEN='<the token above>'\n   Every later command then picks it up; do not ask for a new token each time. It stops working when it expires.\n3. Run (the CLI reads INFISICAL_TOKEN from the environment):`;
+  const run = (inner: string) => `infisical run --silent --domain=${a.host} --projectId=${a.projectId} --env=${a.environment} --path=${a.path} -- ${inner}`;
   // A command that uses $VARS must run inside sh -c '...' so that the inner shell, not yours, expands them.
   const wrap = (cmd: string) => (cmd.includes("$") && !/^sh -c /.test(cmd) ? `sh -c '${cmd}'` : cmd);
   const note = `\nSecrets from ${a.environment}${a.path} reach that one command only.`;
@@ -70,6 +70,6 @@ export function usage(a: { use: Use; host: string; projectId: string; environmen
     case "infisical_run":
       return `${pre}\n${run(wrap(a.command ?? "<your command>"))}${note}`;
     default:
-      return `curl -s -H "Authorization: Bearer $(cat ~/.infisical-token)" "${a.host}/api/v4/secrets?projectId=${a.projectId}&environment=${a.environment}&secretPath=${a.path}"   # lists what the agent identity may read (values hidden)`;
+      return `curl -s -H "Authorization: Bearer $INFISICAL_TOKEN" "${a.host}/api/v4/secrets?projectId=${a.projectId}&environment=${a.environment}&secretPath=${a.path}"   # lists what the agent identity may read (values hidden)`;
   }
 }
