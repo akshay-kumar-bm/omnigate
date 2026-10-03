@@ -11,7 +11,7 @@
     "DEFAULT_ENVIRONMENT": "dev",
     "ALLOWED_EMAILS": "akshaykumarbedre.bm@gmail.com,shipengine.ai@gmail.com",
     // Hosts each secret may be sent to by call_api. Deny by default; add a line per service, then redeploy.
-    "API_HOSTS": "{\"NOTION_TOKEN\":[\"api.notion.com\"],\"GH_TOKEN\":[\"api.github.com\",\"uploads.github.com\"],\"GITHUB_TOKEN\":[\"api.github.com\",\"uploads.github.com\"],\"AWS_ACCESS_KEY_ID\":[\"*.amazonaws.com\"],\"AWS_SECRET_ACCESS_KEY\":[\"*.amazonaws.com\"],\"AWS_SESSION_TOKEN\":[\"*.amazonaws.com\"]}",
+    "API_HOSTS": "{\"NOTION_TOKEN\":[\"api.notion.com\"],\"GH_TOKEN\":[\"api.github.com\",\"uploads.github.com\"],\"GITHUB_TOKEN\":[\"api.github.com\",\"uploads.github.com\"],\"AWS_ACCESS_KEY_ID\":[\"*.amazonaws.com\"],\"AWS_SECRET_ACCESS_KEY\":[\"*.amazonaws.com\"],\"AWS_SESSION_TOKEN\":[\"*.amazonaws.com\"],\"LINEAR_API_TOKEN\":[\"api.linear.app\"]}",
     "PUBLIC_URL": "https://infisical-mcp.shipengine-ai.workers.dev"
   },
   "observability": { "enabled": true }
