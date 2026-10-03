@@ -33,10 +33,10 @@ const AWS = `Running the AWS CLI with Infisical secrets
 Do NOT route the AWS CLI through the Agent Proxy. The docs describe header rewrites and placeholder substitution only, and the AWS CLI signs each request (SigV4) with the secret key on the client, so a placeholder key produces a signature the proxy cannot fix. This is my reading of the docs, not something I tested.
 Use a temporary token with "infisical run" instead (this is how it was tested here):
 1. Store the AWS credentials in a folder, e.g. /aws in dev: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION (and AWS_SESSION_TOKEN if you use temporary ones). Use an IAM user or role with the least rights that work.
-2. Ask the assistant for a token (issue_temp_token, use=aws_cli); you approve with the box ticked. Other uses: git_clone and github_cli (GITHUB_TOKEN from /github), infisical_run (anything else).
+2. Ask the assistant for a token (issue_temp_token); you approve with the box ticked.
 3. Run, with the token it returns:
-     export TOK='<token>'
-     infisical run --silent --token="$TOK" --domain=<infisical-host> --projectId=<project-id> --env=dev --path=/aws -- aws sts get-caller-identity
+     export INFISICAL_TOKEN='<token>'
+     infisical run --silent --domain=<infisical-host> --projectId=<project-id> --env=dev --path=/aws -- aws sts get-caller-identity
    "infisical run" puts the secrets into that one aws process only. Try "aws sts get-caller-identity" first, then your real command.
 Even better: an Infisical AWS IAM dynamic secret ("Temporary Credentials" mode, up to 12 hours) hands out short-lived AWS credentials instead of a stored key. Docs: https://infisical.com/docs/documentation/platform/dynamic-secrets/aws-iam (not tested here).`;
 
@@ -50,26 +50,12 @@ const TOPICS: Record<Topic, string> = { overview: OVERVIEW, agent_identity: AGEN
 export const guide = (topic: Topic = "overview") => TOPICS[topic];
 export const fullGuide = () => [OVERVIEW, AGENT_IDENTITY, AWS, PROXY].join("\n\n");
 
-// Commands for a freshly issued token. The token itself is returned in its own field and referenced as $TOK.
-// No `infisical login` step is needed: the token already is the logged-in session.
-export type Use = "aws_cli" | "git_clone" | "github_cli" | "infisical_run" | "rest_api";
-
-export function usage(a: { use: Use; host: string; projectId: string; environment: string; path: string; command?: string }): string {
-  const pre = `export INFISICAL_DISABLE_UPDATE_CHECK=true\nexport TOK='<the token above>'   # a secret: do not print it, store it or paste it anywhere else`;
-  const run = (inner: string) => `infisical run --silent --token="$TOK" --domain=${a.host} --projectId=${a.projectId} --env=${a.environment} --path=${a.path} -- ${inner}`;
-  // A command that uses $VARS must run inside sh -c '...' so that the inner shell, not yours, expands them.
-  const wrap = (cmd: string) => (cmd.includes("$") && !/^sh -c /.test(cmd) ? `sh -c '${cmd}'` : cmd);
-  const note = `\nSecrets from ${a.environment}${a.path} become environment variables of that one command only. Install the CLI if needed: npm install -g @infisical/cli`;
-  switch (a.use) {
-    case "git_clone":
-      return `${pre}\n${run(wrap(a.command ?? 'git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/<owner>/<repo>.git"'))}${note}\nThe folder ${a.path} needs a GITHUB_TOKEN secret that can read the repository.`;
-    case "github_cli":
-      return `${pre}\n${run(wrap(a.command ?? "gh api user"))}${note}\nThe GitHub CLI reads GITHUB_TOKEN from the environment. Prefer "gh api <endpoint>" (REST): "gh repo view/clone" use GraphQL, which some sandboxes (including Claude Code cloud sessions) block.`;
-    case "aws_cli":
-      return `${pre}\n${run(wrap(a.command ?? "aws sts get-caller-identity"))}${note}\nThe folder ${a.path} needs AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_DEFAULT_REGION.`;
-    case "infisical_run":
-      return `${pre}\n${run(wrap(a.command ?? "<your command>"))}${note}`;
-    default:
-      return `curl -s -H "Authorization: Bearer $TOK" "${a.host}/api/v4/secrets?projectId=${a.projectId}&environment=${a.environment}&secretPath=${a.path}"   # lists what the agent identity may read (values hidden)`;
-  }
+// Steps for a freshly issued token. Generic on purpose: the same text for any CLI and any use.
+export function usage(a: { host: string; projectId: string; environment: string }): string {
+  return `1. Install the CLI once: npm install -g @infisical/cli
+2. Set the token once as a global environment variable (never print it): echo "export INFISICAL_TOKEN='<the token above>'" >> ~/.bashrc && export INFISICAL_TOKEN='<the token above>'
+   Later commands pick it up; do not ask for a new token each time. It stops working when it expires.
+3. Run any command with the secrets of a folder injected into it (the CLI reads INFISICAL_TOKEN):
+   infisical run --silent --domain=${a.host} --projectId=${a.projectId} --env=${a.environment} --path=<folder, e.g. /github> -- <command>
+   A command that uses $VARS must be wrapped: sh -c '<command using $VARS>'`;
 }

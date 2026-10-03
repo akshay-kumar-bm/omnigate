@@ -11,6 +11,7 @@
   "vars": {
     "INFISICAL_HOST": "https://us.infisical.com",
     "INFISICAL_PROJECT_ID": "e550c9ba-7757-4c6f-a3c2-ca83e8ec20b3",
+    "AGENT_PROJECT_ID": "cd937b43-5001-4e01-b920-8e7ccc4ad52c",
     "DEFAULT_ENVIRONMENT": "dev",
     "ALLOWED_EMAILS": "akshaykumarbedre.bm@gmail.com,shipengine.ai@gmail.com",
     "PUBLIC_URL": "https://infisical-mcp.shipengine-ai.workers.dev"
