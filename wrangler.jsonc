@@ -9,7 +9,7 @@
     "INFISICAL_HOST": "https://us.infisical.com",
     "INFISICAL_PROJECT_ID": "e550c9ba-7757-4c6f-a3c2-ca83e8ec20b3",
     "DEFAULT_ENVIRONMENT": "dev",
-    "ALLOWED_EMAILS": "akshaykumarbedre.bm@gmail.com",
+    "ALLOWED_EMAILS": "akshaykumarbedre.bm@gmail.com,shipengine.ai@gmail.com",
     "PLACEHOLDER_PREFIX": "infisical-agent-proxy",
     "PUBLIC_URL": "https://infisical-mcp.shipengine-ai.workers.dev"
   },
