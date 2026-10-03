@@ -8,6 +8,7 @@ import { buildComment, commentHosts } from "./hosts";
 
 export interface Env {
   OAUTH_KV: KVNamespace;
+  APPROVAL_STORE?: DurableObjectNamespace<import("./approval-store").ApprovalStore>; // absent only in local tests
   OAUTH_PROVIDER: any;
   // vars
   INFISICAL_HOST: string;

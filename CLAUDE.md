@@ -13,8 +13,9 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 - `src/index.ts`: wires the OAuth provider (`/mcp`, `/authorize`, `/token`, `/register`) around the MCP server.
 - `src/server.ts`: the MCP server and its tools (no Cloudflare-only imports, so it runs under Node for tests).
 - `src/api-call.ts`: the `api_request` logic (auth types, host check, uploads, redaction).
+- `src/approval-store.ts` / `src/store-core.ts`: the Durable Object and its Node-testable logic (expiry, sweep).
 - `src/destructive.ts`: best-effort detection of destructive api_request calls beyond HTTP DELETE.
-- `src/approvals.ts`: approval records (KV), the `/approve/*` pages, and the approval Google sign-in via `/callback` (state `ap.*`).
+- `src/approvals.ts`: approval records (Durable Object `ApprovalStore`, strongly consistent; KV only as a test fallback), the `/approve/*` pages, and the approval Google sign-in via `/callback` (state `ap.*`).
 - `src/hosts.ts`: validation and parsing of the `hosts:` comment line.
 - `src/infisical.ts`: thin Infisical REST client (Universal Auth). `getSecretValue` is server-side only.
 - `src/google-handler.ts`: Google sign-in, consent page, `/callback`. Bad OAuth params return 400, not a crash.

@@ -4,6 +4,7 @@ import { GoogleHandler } from "./google-handler";
 import { createServer, type Env } from "./server";
 
 export type { Env } from "./server";
+export { ApprovalStore } from "./approval-store";
 
 let provider: OAuthProvider<Env> | undefined;
 export default {

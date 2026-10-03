@@ -8,7 +8,7 @@
 // cookie in the human's browser) plus a one-time confirm nonce, and the confirming request must carry that cookie.
 import type { Env } from "./server";
 
-type ApprovalEnv = Pick<Env, "OAUTH_KV" | "PUBLIC_URL" | "GOOGLE_CLIENT_ID" | "GOOGLE_CLIENT_SECRET" | "ALLOWED_EMAILS">;
+type ApprovalEnv = Pick<Env, "OAUTH_KV" | "APPROVAL_STORE" | "PUBLIC_URL" | "GOOGLE_CLIENT_ID" | "GOOGLE_CLIENT_SECRET" | "ALLOWED_EMAILS">;
 
 interface ApprovalRecord {
   id: string;
@@ -19,6 +19,19 @@ interface ApprovalRecord {
   approver?: string;
   created: number;
 }
+
+// Approvals, sessions, nonces and sign-in state live in a Durable Object (strongly consistent). Workers KV is only
+// eventually consistent, so an approval made in one region could still read as "pending" elsewhere for up to a minute.
+// KV is the fallback only when the binding is absent (local tests).
+interface Store { get(k: string): Promise<string | null>; put(k: string, v: string, ttlSeconds: number): Promise<void>; delete(k: string): Promise<void> }
+const store = (env: ApprovalEnv): Store => {
+  if (env.APPROVAL_STORE) {
+    const s = env.APPROVAL_STORE.get(env.APPROVAL_STORE.idFromName("global"));
+    return { get: (k) => s.get(k), put: (k, v, t) => s.put(k, v, t), delete: (k) => s.delete(k) };
+  }
+  const kv = env.OAUTH_KV;
+  return { get: (k) => kv.get(k), put: (k, v, t) => kv.put(k, v, { expirationTtl: Math.max(60, t) }), delete: (k) => kv.delete(k) };
+};
 
 const TTL_SECONDS = 15 * 60;
 const SESSION_SECONDS = 12 * 60 * 60;
@@ -50,10 +63,10 @@ export const fingerprint = (tool: string, args: Record<string, unknown>) => {
 
 const load = async (env: ApprovalEnv, id: string): Promise<ApprovalRecord | null> => {
   if (!ID_RE.test(id)) return null;
-  const raw = await env.OAUTH_KV.get(`approval:${id}`);
+  const raw = await store(env).get(`approval:${id}`);
   return raw ? (JSON.parse(raw) as ApprovalRecord) : null;
 };
-const save = (env: ApprovalEnv, r: ApprovalRecord) => env.OAUTH_KV.put(`approval:${r.id}`, JSON.stringify(r), { expirationTtl: TTL_SECONDS });
+const save = (env: ApprovalEnv, r: ApprovalRecord) => store(env).put(`approval:${r.id}`, JSON.stringify(r), TTL_SECONDS);
 export const approvalUrl = (env: ApprovalEnv, id: string) => `${env.PUBLIC_URL}/approve/${id}`;
 
 export async function requestApproval(env: ApprovalEnv, tool: string, args: Record<string, unknown>, summary: string[]) {
@@ -68,7 +81,7 @@ export async function checkApproval(env: ApprovalEnv, id: string, tool: string, 
   if (!r) return { ok: false, reason: "That approval does not exist or has expired." };
   if (r.tool !== tool || r.fp !== (await fingerprint(tool, args))) return { ok: false, reason: "That approval was given for a different action. Request a new one." };
   if (r.status !== "approved") return { ok: false, reason: `Not approved yet. Ask the user to open ${approvalUrl(env, id)} and press Approve.` };
-  await env.OAUTH_KV.delete(`approval:${id}`);
+  await store(env).delete(`approval:${id}`);
   return { ok: true };
 }
 
@@ -97,20 +110,20 @@ const cookieValue = (req: Request) => (req.headers.get("cookie") ?? "").split(/;
 
 export async function createSession(env: ApprovalEnv, email: string): Promise<string> {
   const token = rand(24);
-  await env.OAUTH_KV.put(`apsession:${token}`, JSON.stringify({ email, created: Date.now() }), { expirationTtl: SESSION_SECONDS });
+  await store(env).put(`apsession:${token}`, JSON.stringify({ email, created: Date.now() }), SESSION_SECONDS);
   return sessionCookie(token, SESSION_SECONDS);
 }
 async function getSession(req: Request, env: ApprovalEnv): Promise<{ email: string } | null> {
   const token = cookieValue(req);
   if (!/^[A-Za-z0-9_-]{16,64}$/.test(token)) return null;
-  const raw = await env.OAUTH_KV.get(`apsession:${token}`);
+  const raw = await store(env).get(`apsession:${token}`);
   return raw ? (JSON.parse(raw) as { email: string }) : null;
 }
 
 // The review page: exact action + Approve / Deny. The nonce is bound to this approval and this signed-in email.
 async function reviewPage(env: ApprovalEnv, r: ApprovalRecord, email: string, extra: Record<string, string> = {}) {
   const nonce = rand(24);
-  await env.OAUTH_KV.put(`apconfirm:${nonce}`, JSON.stringify({ id: r.id, email }), { expirationTtl: 300 });
+  await store(env).put(`apconfirm:${nonce}`, JSON.stringify({ id: r.id, email }), 300);
   return page(
     "Approve this action?",
     `<p>An assistant wants to:</p>${details(r)}<p style="color:#555;font-size:.9rem">Signed in as ${esc(email)}. Only approve if you asked for exactly this.</p>
@@ -126,7 +139,7 @@ async function reviewPage(env: ApprovalEnv, r: ApprovalRecord, email: string, ex
 async function startGoogle(env: ApprovalEnv, origin: string, id: string): Promise<Response> {
   const state = `ap.${rand()}`;
   const verifier = rand(32) + rand(32);
-  await env.OAUTH_KV.put(`apstate:${state}`, JSON.stringify({ id, verifier }), { expirationTtl: 600 });
+  await store(env).put(`apstate:${state}`, JSON.stringify({ id, verifier }), 600);
   const challenge = b64u(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))));
   const g = new URL("https://accounts.google.com/o/oauth2/v2/auth");
   g.search = new URLSearchParams({
@@ -142,7 +155,7 @@ export async function handleApprovalRequest(req: Request, env: ApprovalEnv): Pro
 
   if (url.pathname === "/approve/signout" && req.method === "POST") {
     const token = cookieValue(req);
-    if (token) await env.OAUTH_KV.delete(`apsession:${token}`);
+    if (token) await store(env).delete(`apsession:${token}`);
     return page("Signed out", "<p>You are signed out of approvals. The next approval link will ask you to sign in with Google again.</p>", 200, { "set-cookie": sessionCookie("", 0) });
   }
 
@@ -165,14 +178,14 @@ export async function handleApprovalRequest(req: Request, env: ApprovalEnv): Pro
     const form = await req.formData();
     const nonce = String(form.get("nonce") ?? "");
     const key = `apconfirm:${nonce}`;
-    const raw = nonce ? await env.OAUTH_KV.get(key) : null;
+    const raw = nonce ? await store(env).get(key) : null;
     const c = raw ? (JSON.parse(raw) as { id: string; email: string }) : null;
     const session = await getSession(req, env);
     // The nonce alone is not enough: the request must also carry the session cookie of the same signed-in person.
     if (!c || c.id !== id || !session || session.email !== c.email) return page("Session expired", "<p>Open the approval link again.</p>", 400);
-    await env.OAUTH_KV.delete(key);
+    await store(env).delete(key);
     if (action === "deny") {
-      await env.OAUTH_KV.delete(`approval:${id}`);
+      await store(env).delete(`approval:${id}`);
       return page("Denied", "<p>The action was denied and will not run.</p>");
     }
     await save(env, { ...r, status: "approved", approver: c.email });
@@ -186,9 +199,9 @@ export async function handleApprovalRequest(req: Request, env: ApprovalEnv): Pro
 export async function finishApprovalSignIn(req: Request, env: ApprovalEnv): Promise<Response> {
   const url = new URL(req.url);
   const state = url.searchParams.get("state") ?? "";
-  const raw = await env.OAUTH_KV.get(`apstate:${state}`);
+  const raw = await store(env).get(`apstate:${state}`);
   if (!raw) return page("Sign-in expired", "<p>Open the approval link again.</p>", 400);
-  await env.OAUTH_KV.delete(`apstate:${state}`);
+  await store(env).delete(`apstate:${state}`);
   const { id, verifier } = JSON.parse(raw) as { id: string; verifier: string };
   const code = url.searchParams.get("code");
   if (url.searchParams.get("error") || !code) return page("Sign-in cancelled", "<p>Nothing was approved.</p>", 400);
