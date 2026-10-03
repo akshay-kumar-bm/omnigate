@@ -28,8 +28,23 @@ const fail = (e: unknown) => ({ isError: true, content: [{ type: "text" as const
 
 const secretName = z.string().min(1).regex(/^[A-Za-z0-9_.\-]+$/, "letters, digits, _ . - only");
 
+const INSTRUCTIONS = [
+  "Universal API: make authenticated calls to any HTTPS API or integration (GitHub, Jira, Notion, Stripe, Slack, AWS, ...) without ever seeing the credentials.",
+  "Use api_request for the call itself: pass the secret NAME plus the URL, method and body; the server adds the token and returns the response with the token redacted.",
+  "Use list_secrets to see which credentials exist (names only) and add_secret to store a new one. A secret can only be sent to hosts its owner has approved; if api_request says a host is not allowed, tell the user which secret and host to approve in the server's API_HOSTS config.",
+  "Never ask the user to paste a token into the chat if it can be stored with add_secret, and never try to read secret values back.",
+].join("\n");
+
 function createServer(env: Env) {
-  const server = new McpServer({ name: "infisical-secrets", version: "0.1.0" });
+  const server = new McpServer(
+    {
+      name: "universal-api",
+      title: "Universal API",
+      version: "0.2.0",
+      description: "Call any HTTPS API or integration (GitHub, Jira, Notion, Stripe, Slack, AWS, ...) with credentials kept in a vault. You never see the tokens.",
+    },
+    { instructions: INSTRUCTIONS },
+  );
   {
     const base = (a: { environment?: string; path?: string }) => ({
       projectId: env.INFISICAL_PROJECT_ID,
@@ -40,52 +55,13 @@ function createServer(env: Env) {
       environment: z.string().optional().describe("Environment slug (default from config, e.g. dev)"),
       path: z.string().optional().describe("Folder path, default /"),
     };
-    server.registerTool("list_environments", { description: "List environments of the configured Infisical project.", inputSchema: z.object({}) }, async () => {
-      try { return ok(await infisical.listEnvironments(env, env.INFISICAL_PROJECT_ID)); } catch (e) { return fail(e); }
-    });
-
     server.registerTool(
-      "list_folders",
-      { description: "List folders under a path in an environment.", inputSchema: z.object({ ...loc, recursive: z.boolean().default(false) }) },
-      async (a) => {
-        try {
-          const b = base(a);
-          const r = await infisical.listFolders(env, { projectId: b.projectId, environment: b.environment, path: b.secretPath, recursive: a.recursive });
-          return ok((r.folders ?? []).map((f: any) => ({ name: f.name, path: f.relativePath ?? f.name })));
-        } catch (e) { return fail(e); }
-      },
-    );
-
-    server.registerTool(
-      "list_secrets",
-      { description: "List secret names and metadata. Values are never returned.", inputSchema: z.object({ ...loc, recursive: z.boolean().default(false) }) },
-      async (a) => {
-        try {
-          const b = base(a);
-          const r = await infisical.listSecrets(env, { ...b, recursive: a.recursive });
-          return ok((r.secrets ?? []).map(redact));
-        } catch (e) { return fail(e); }
-      },
-    );
-
-    server.registerTool(
-      "get_secret",
-      { description: "Get a secret's metadata. The raw value is never returned; to use a secret in an API request, call call_api with its name.", inputSchema: z.object({ name: secretName, ...loc }) },
-      async (a) => {
-        try {
-          const b = base(a);
-          const r = await infisical.getSecret(env, a.name, b);
-          return ok(redact(r.secret));
-        } catch (e) { return fail(e); }
-      },
-    );
-
-    server.registerTool(
-      "call_api",
+      "api_request",
       {
         description:
-          "Make an authenticated HTTPS API call using a stored secret without ever seeing it. Pass the secret NAME; the server reads the token, adds the auth, calls the API and returns the response. " +
-          "A secret can only be sent to hosts listed for it in the server's API_HOSTS config (otherwise the call is refused). Redirects are not followed. " +
+          "Make an authenticated HTTPS request to ANY API or integration (GitHub, Jira, Notion, Stripe, Slack, AWS, ...) using a credential stored in this server, without ever seeing it. Use this whenever you need to call a third-party API on the user's behalf. " +
+          "Pass the secret NAME (see list_secrets); the server reads the token, adds the auth, calls the API and returns the response with the token redacted. " +
+          "A secret can only be sent to hosts its owner approved in the server's API_HOSTS config, otherwise the call is refused. Redirects are not followed. " +
           "auth_type: bearer (default; Authorization: Bearer <secret>), header (header_name + optional header_prefix), basic (secret = 'user:pass', or username + secret as password), query (query_param), " +
           "file uploads: body_base64 (raw bytes) or multipart (form with files), up to 5 MB; aws_sigv4 (signs with secrets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / optional AWS_SESSION_TOKEN; needs aws_service and aws_region). Do not send your own Authorization header.",
         inputSchema: z.object({
@@ -123,9 +99,49 @@ function createServer(env: Env) {
       },
     );
 
+    server.registerTool("list_environments", { description: "List environments of the configured Infisical project.", inputSchema: z.object({}) }, async () => {
+      try { return ok(await infisical.listEnvironments(env, env.INFISICAL_PROJECT_ID)); } catch (e) { return fail(e); }
+    });
+
+    server.registerTool(
+      "list_folders",
+      { description: "List folders under a path in an environment.", inputSchema: z.object({ ...loc, recursive: z.boolean().default(false) }) },
+      async (a) => {
+        try {
+          const b = base(a);
+          const r = await infisical.listFolders(env, { projectId: b.projectId, environment: b.environment, path: b.secretPath, recursive: a.recursive });
+          return ok((r.folders ?? []).map((f: any) => ({ name: f.name, path: f.relativePath ?? f.name })));
+        } catch (e) { return fail(e); }
+      },
+    );
+
+    server.registerTool(
+      "list_secrets",
+      { description: "List the credentials available to api_request (names and metadata only; values are never returned).", inputSchema: z.object({ ...loc, recursive: z.boolean().default(false) }) },
+      async (a) => {
+        try {
+          const b = base(a);
+          const r = await infisical.listSecrets(env, { ...b, recursive: a.recursive });
+          return ok((r.secrets ?? []).map(redact));
+        } catch (e) { return fail(e); }
+      },
+    );
+
+    server.registerTool(
+      "get_secret",
+      { description: "Get a secret's metadata. The raw value is never returned; to use a secret in an API request, call api_request with its name.", inputSchema: z.object({ name: secretName, ...loc }) },
+      async (a) => {
+        try {
+          const b = base(a);
+          const r = await infisical.getSecret(env, a.name, b);
+          return ok(redact(r.secret));
+        } catch (e) { return fail(e); }
+      },
+    );
+
     server.registerTool(
       "add_secret",
-      { description: "Create a new secret. The value is written to Infisical and not echoed back.", inputSchema: z.object({ name: secretName, value: z.string().min(1), comment: z.string().optional(), ...loc }) },
+      { description: "Store a new credential (e.g. a GitHub or Jira token) so api_request can use it. The value is written to Infisical and not echoed back. Remember to approve its host in API_HOSTS.", inputSchema: z.object({ name: secretName, value: z.string().min(1), comment: z.string().optional(), ...loc }) },
       async (a) => {
         try {
           const b = base(a);
