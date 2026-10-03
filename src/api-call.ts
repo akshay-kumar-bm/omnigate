@@ -1,9 +1,10 @@
 // api_request: make an authenticated HTTPS request using a stored secret, entirely server-side.
 // The model supplies the secret NAME; the Worker reads the value from Infisical, injects it, calls the API
-// and returns only the response (with the secret redacted). A secret can only be sent to hosts listed for it
-// in the API_HOSTS config var, which only the Worker owner can change (redeploy), so a prompt-injected
-// client cannot point a token at an attacker's server.
+// and returns only the response (with the secret redacted). A secret can only be sent to hosts approved for it:
+// the built-in list (default-hosts.ts) plus the API_HOSTS config var, both changeable only by the Worker owner
+// (redeploy), so a prompt-injected client cannot point a token at an attacker's server.
 import { AwsClient } from "aws4fetch";
+import { commentHosts, DEFAULT_API_HOSTS } from "./default-hosts";
 import { infisical } from "./infisical";
 
 export interface ApiCallEnv {
@@ -12,7 +13,7 @@ export interface ApiCallEnv {
   INFISICAL_CLIENT_SECRET: string;
   INFISICAL_PROJECT_ID: string;
   DEFAULT_ENVIRONMENT: string;
-  API_HOSTS: string; // JSON: { "SECRET_NAME": ["api.example.com", "*.example.com"] }
+  API_HOSTS: string; // JSON overrides/additions to the built-in list: { "SECRET_NAME": ["api.example.com", "*.example.com"] }
 }
 
 export interface ApiCallArgs {
@@ -43,17 +44,29 @@ const MAX_UPLOAD = 5 * 1024 * 1024; // decoded bytes, per request
 const TIMEOUT_MS = 25_000;
 const KEEP_HEADERS = ["content-type", "link", "location", "retry-after", "etag", "x-request-id", "x-amzn-requestid", "x-ratelimit-remaining", "x-ratelimit-reset"];
 
-function parseHosts(env: ApiCallEnv): Record<string, string[]> {
+function parseHosts(env: ApiCallEnv): Record<string, unknown> {
   try {
     const m = JSON.parse(env.API_HOSTS || "{}");
-    return m && typeof m === "object" ? m : {};
+    return m && typeof m === "object" && !Array.isArray(m) ? m : {};
   } catch {
     throw new Error("API_HOSTS config is not valid JSON");
   }
 }
 
+// Approved hosts for a secret. An API_HOSTS entry for the name wins outright ([] disables everything for it);
+// otherwise the built-in list plus the hosts in the secret's own comment.
+export function approvedHosts(env: ApiCallEnv, name: string, comment?: string | null): string[] {
+  const custom = parseHosts(env);
+  const own = (o: object) => Object.prototype.hasOwnProperty.call(o, name);
+  if (own(custom)) {
+    const v = custom[name];
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+  }
+  return [...new Set([...(own(DEFAULT_API_HOSTS) ? DEFAULT_API_HOSTS[name] : []), ...commentHosts(comment)])];
+}
+
 export function hostAllowed(host: string, patterns: string[] | undefined): boolean {
-  if (!patterns) return false;
+  if (!patterns || patterns.length === 0) return false;
   const h = host.toLowerCase();
   return patterns.some((raw) => {
     const p = raw.toLowerCase();
@@ -80,16 +93,20 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
 
   const method = (a.method ?? "GET").toUpperCase();
   const authType = a.auth_type ?? "bearer";
-  const hosts = parseHosts(env);
   const loc = { projectId: env.INFISICAL_PROJECT_ID, environment: a.environment ?? env.DEFAULT_ENVIRONMENT, secretPath: a.path ?? "/" };
   const used: string[] = []; // secret values, for redaction
   const read = async (name: string) => {
-    if (!hostAllowed(url.hostname, hosts[name])) {
-      throw new Error(`Secret ${name} is not allowed to be sent to ${url.hostname}. Add it to API_HOSTS in wrangler.jsonc and redeploy.`);
+    const secret = await infisical.getSecretValue(env, name, loc);
+    const approved = approvedHosts(env, name, secret.comment);
+    if (!hostAllowed(url.hostname, approved)) {
+      throw new Error(
+        `Secret ${name} is not allowed to be sent to ${url.hostname}. ` +
+        (approved.length ? `Approved hosts for it: ${approved.join(", ")}. ` : "No hosts are approved for it. ") +
+        "Hosts are set when the secret is stored (add_secret hosts) and cannot be changed through this server; the owner can edit the secret's comment in Infisical or add an API_HOSTS entry.",
+      );
     }
-    const v = await infisical.getSecretValue(env, name, loc);
-    used.push(v);
-    return v;
+    used.push(secret.value);
+    return secret.value;
   };
 
   const headers = new Headers(a.headers ?? {});
@@ -136,7 +153,7 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
     const secretKey = await read(a.aws_secret_key_secret ?? "AWS_SECRET_ACCESS_KEY");
     const tokenName = a.aws_session_token_secret ?? "AWS_SESSION_TOKEN";
     let sessionToken: string | undefined;
-    if (hosts[tokenName]) { try { sessionToken = await read(tokenName); } catch { /* optional */ } }
+    try { sessionToken = await read(tokenName); } catch { /* optional; also skipped if not approved for this host */ }
     const client = new AwsClient({
       accessKeyId: accessKey, secretAccessKey: secretKey, sessionToken,
       service: need(a.aws_service, "aws_service"), region: need(a.aws_region, "aws_region"),

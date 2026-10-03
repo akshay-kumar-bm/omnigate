@@ -67,13 +67,14 @@ export const infisical = {
       query: { ...q, type: "shared", viewSecretValue: "false", expandSecretReferences: "false", includeImports: "false" },
     }),
   // Server-side use only (api_request). The value must never be returned to the MCP client.
-  getSecretValue: async (env: InfisicalEnv, name: string, q: { projectId: string; environment: string; secretPath: string }): Promise<string> => {
+  getSecretValue: async (env: InfisicalEnv, name: string, q: { projectId: string; environment: string; secretPath: string }): Promise<{ value: string; comment: string }> => {
+    // expandSecretReferences=false: a secret whose value is "${OTHER}" must not resolve to another secret's value.
     const r = await call(env, "GET", `/api/v4/secrets/${encodeURIComponent(name)}`, {
-      query: { ...q, type: "shared", viewSecretValue: "true", expandSecretReferences: "true", includeImports: "true" },
+      query: { ...q, type: "shared", viewSecretValue: "true", expandSecretReferences: "false", includeImports: "true" },
     });
     const v = r?.secret?.secretValue;
     if (typeof v !== "string" || v === "") throw new Error(`Secret ${name} has no readable value`);
-    return v;
+    return { value: v, comment: String(r.secret.secretComment ?? "") };
   },
   createSecret: (env: InfisicalEnv, name: string, body: Record<string, unknown>) =>
     call(env, "POST", `/api/v4/secrets/${encodeURIComponent(name)}`, { body: { type: "shared", ...body } }),

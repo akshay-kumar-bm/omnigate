@@ -9,7 +9,7 @@ Main tool: **`api_request`**. Supporting tools for the credentials it uses: `lis
 **Values never come back to the client.** List/get use `viewSecretValue=false` and responses are redacted. `add_secret`/`update_secret` do pass the new value through the MCP client once.
 
 ## Making API calls: `api_request`
-Connect this MCP to any Claude session and it can call any HTTPS API or integration with a stored token without ever seeing the token. To connect a new integration: `add_secret` its token, add its host to `API_HOSTS`, redeploy. The model passes the secret *name*; the Worker reads the value from Infisical, adds the auth, calls the API and returns only the response (the token is redacted from it).
+Connect this MCP to any Claude session and it can call any HTTPS API or integration with a stored token without ever seeing the token. To connect a new integration: `add_secret` its token, store it under its conventional name (built-in), or `add_secret` it with `hosts`. No redeploy needed. The model passes the secret *name*; the Worker reads the value from Infisical, adds the auth, calls the API and returns only the response (the token is redacted from it).
 
 ```
 api_request { url: "https://api.notion.com/v1/users/me", secret: "NOTION_TOKEN", headers: { "Notion-Version": "2022-06-28" } }
@@ -27,7 +27,11 @@ api_request { url: "https://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentit
 S3: `PUT https://<bucket>.s3.<region>.amazonaws.com/<key>` with `auth_type: aws_sigv4`, `aws_service: s3` and `body_base64`.
 
 **Safety rules**
-- A secret can only be sent to hosts listed for it in the `API_HOSTS` var in `wrangler.jsonc` (deny by default; `*.example.com` matches any subdomain depth). Only the Worker owner can change it, by redeploying. To add a service: store its token (`add_secret`), add `"MY_TOKEN": ["api.example.com"]` to `API_HOSTS`, `npx wrangler deploy`.
+- A secret can only be sent to hosts approved for it. Approved hosts come from three places, deny by default:
+  1. **Built-in** list for well-known services by secret name (`src/default-hosts.ts`: `NOTION_TOKEN`, `GITHUB_TOKEN`/`GH_TOKEN`, `LINEAR_API_TOKEN`, `TAVILY_API_KEY`, `FIRECRAWL_API_KEY`, `STRIPE_API_KEY`, `SLACK_BOT_TOKEN`, `OPENAI_API_KEY`, `JIRA_AUTH`, `AWS_*`, ...). Nothing to configure.
+  2. **The secret's own comment.** For any other service, `add_secret` takes `hosts` (e.g. `["api.example.com"]` or `["*.example.com"]`) and saves them as a `hosts: ...` line in the secret's comment, visible in Infisical and in `list_secrets`/`get_secret` (`approved_hosts`). Hosts are fixed at creation: `update_secret` keeps that line and drops any `hosts:` the model types into a new comment, so a tricked model can't widen them later. The owner can edit the comment in the Infisical dashboard. Wildcards need two labels (`*.example.com`) and are refused on shared-hosting domains such as `*.workers.dev` or `*.github.io`; no IPs, ports, schemes, paths or internal domains.
+  3. **`API_HOSTS`** in `wrangler.jsonc` (JSON, owner only, needs a deploy). An entry for a name wins over both of the above, and `"NAME": []` disables everything for it.
+- Secret references (`${OTHER}`) are not expanded when `api_request` reads a value, so a secret can't be used to leak another secret.
 - HTTPS only, default port only, redirects are not followed, 25 s timeout, response body capped at 60 KB, uploads capped at 5 MB, secrets redacted from the body and headers. The client may not set its own `Authorization` header.
 - Secrets are read from `DEFAULT_ENVIRONMENT` (`dev`) unless `environment`/`path` is passed.
 - This is not a shell: it cannot run CLIs like `aws` or `gh`. For those, use `infisical run --env=dev -- <cmd>` in a session that has the Infisical CLI.

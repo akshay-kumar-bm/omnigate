@@ -10,8 +10,9 @@
     "INFISICAL_PROJECT_ID": "e550c9ba-7757-4c6f-a3c2-ca83e8ec20b3",
     "DEFAULT_ENVIRONMENT": "dev",
     "ALLOWED_EMAILS": "akshaykumarbedre.bm@gmail.com,shipengine.ai@gmail.com",
-    // Hosts each secret may be sent to by call_api. Deny by default; add a line per service, then redeploy.
-    "API_HOSTS": "{\"NOTION_TOKEN\":[\"api.notion.com\"],\"GH_TOKEN\":[\"api.github.com\",\"uploads.github.com\"],\"GITHUB_TOKEN\":[\"api.github.com\",\"uploads.github.com\"],\"AWS_ACCESS_KEY_ID\":[\"*.amazonaws.com\"],\"AWS_SECRET_ACCESS_KEY\":[\"*.amazonaws.com\"],\"AWS_SESSION_TOKEN\":[\"*.amazonaws.com\"],\"LINEAR_API_TOKEN\":[\"api.linear.app\"]}",
+    // Extra or overriding approved hosts for api_request, as JSON: {"MY_TOKEN":["api.example.com"],"JIRA_AUTH":["*.atlassian.net"]}.
+    // Well-known services (Notion, GitHub, Linear, Stripe, ...) are already approved in src/default-hosts.ts; "NAME":[] disables one.
+    "API_HOSTS": "{}",
     "PUBLIC_URL": "https://infisical-mcp.shipengine-ai.workers.dev"
   },
   "observability": { "enabled": true }
