@@ -9,7 +9,7 @@ Main tool: **`api_request`**. Supporting tools for the credentials it uses: `lis
 **Values never come back to the client.** List/get use `viewSecretValue=false` and responses are redacted. `add_secret`/`update_secret` do pass the new value through the MCP client once.
 
 ## Making API calls: `api_request`
-Connect this MCP to any Claude session and it can call any HTTPS API or integration with a stored token without ever seeing the token. To connect a new integration: `add_secret` its token, add its host to `API_HOSTS`, redeploy. The model passes the secret *name*; the Worker reads the value from Infisical, adds the auth, calls the API and returns only the response (the token is redacted from it).
+Connect this MCP to any Claude session and it can call any HTTPS API or integration with a stored token without ever seeing the token. To connect a new integration: `add_secret` its token, `add_secret` its token with `hosts`. No redeploy needed. The model passes the secret *name*; the Worker reads the value from Infisical, adds the auth, calls the API and returns only the response (the token is redacted from it).
 
 ```
 api_request { url: "https://api.notion.com/v1/users/me", secret: "NOTION_TOKEN", headers: { "Notion-Version": "2022-06-28" } }
@@ -27,10 +27,23 @@ api_request { url: "https://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentit
 S3: `PUT https://<bucket>.s3.<region>.amazonaws.com/<key>` with `auth_type: aws_sigv4`, `aws_service: s3` and `body_base64`.
 
 **Safety rules**
-- A secret can only be sent to hosts listed for it in the `API_HOSTS` var in `wrangler.jsonc` (deny by default; `*.example.com` matches any subdomain depth). Only the Worker owner can change it, by redeploying. To add a service: store its token (`add_secret`), add `"MY_TOKEN": ["api.example.com"]` to `API_HOSTS`, `npx wrangler deploy`.
+- A secret can only be sent to the hosts in **its own comment**, a line like `hosts: api.example.com, *.example.com`. There is no built-in list and no config var: no `hosts:` line means the secret is never sent anywhere (fine for IDs and config).
+  - `add_secret` takes `hosts` and writes that line. It is visible in Infisical and as `approved_hosts` in `list_secrets`/`get_secret`.
+  - Hosts are **fixed at creation**: `update_secret` keeps the line and drops any `hosts:` typed into a new comment, so a tricked model can't point an existing token at another site. The owner can edit the comment in the Infisical dashboard.
+  - Hosts must be bare hostnames (no scheme, path, port, IP or internal domain). Wildcards need two labels (`*.example.com`, matches any subdomain depth, never the bare domain) and are refused on shared-hosting domains such as `*.workers.dev` or `*.github.io`.
+  - To connect a new service: `add_secret` its token with `hosts` (e.g. `["api.linear.app"]`). No redeploy.
+- Secret references (`${OTHER}`) are not expanded when `api_request` reads a value, so a secret can't be used to leak another secret.
 - HTTPS only, default port only, redirects are not followed, 25 s timeout, response body capped at 60 KB, uploads capped at 5 MB, secrets redacted from the body and headers. The client may not set its own `Authorization` header.
-- Secrets are read from `DEFAULT_ENVIRONMENT` (`dev`) unless `environment`/`path` is passed.
+- Secrets are read from `DEFAULT_ENVIRONMENT` (`dev`) unless `environment` is passed. Keep one Infisical folder per service (`/notion`, `/github`, ...): `api_request` finds a secret by name in any folder, refuses to guess if the same name is in several (pass `path`), and `list_secrets` searches all folders by default. `add_secret` takes `path` to choose the folder.
 - This is not a shell: it cannot run CLIs like `aws` or `gh`. For those, use `infisical run --env=dev -- <cmd>` in a session that has the Infisical CLI.
+
+## Approval for destructive actions
+These always need a human, enforced by the server (not by the model): `delete_secret`, `update_secret` with a new value or name, and `api_request` with method `DELETE`. Everything else (reads, creates, other writes, comment-only edits) runs automatically.
+1. The first call returns `approval_required` with an `approve_url` and does nothing.
+2. The user opens the link, signs in with Google (an account in `ALLOWED_EMAILS`) and presses **Approve** (or **Deny**). A model can't do this: it needs the Google sign-in and a one-time nonce that only that browser receives.
+3. The model repeats the identical call with `approval_id`. The approval is bound to the exact tool and arguments (a different URL, name or body is refused), works once, and expires after 15 minutes.
+
+Limits: only the actions above are gated. A destructive call made with `POST`/`PATCH` (for example a GraphQL delete mutation or Notion `archived: true`) is not detected, and method-override headers are refused so they can't disguise a `DELETE`.
 
 ## Deploy
 Pushes to `main` deploy automatically via GitHub Actions (`.github/workflows/deploy.yml`; repo secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`). The steps below are the one-time setup and the manual route.

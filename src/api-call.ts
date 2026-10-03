@@ -1,9 +1,10 @@
 // api_request: make an authenticated HTTPS request using a stored secret, entirely server-side.
 // The model supplies the secret NAME; the Worker reads the value from Infisical, injects it, calls the API
-// and returns only the response (with the secret redacted). A secret can only be sent to hosts listed for it
-// in the API_HOSTS config var, which only the Worker owner can change (redeploy), so a prompt-injected
-// client cannot point a token at an attacker's server.
+// and returns only the response (with the secret redacted). A secret can only be sent to the hosts in its own
+// comment (`hosts: ...`), which are fixed when it is created (see hosts.ts), so a prompt-injected client
+// cannot point an existing token at an attacker's server.
 import { AwsClient } from "aws4fetch";
+import { commentHosts } from "./hosts";
 import { infisical } from "./infisical";
 
 export interface ApiCallEnv {
@@ -12,7 +13,6 @@ export interface ApiCallEnv {
   INFISICAL_CLIENT_SECRET: string;
   INFISICAL_PROJECT_ID: string;
   DEFAULT_ENVIRONMENT: string;
-  API_HOSTS: string; // JSON: { "SECRET_NAME": ["api.example.com", "*.example.com"] }
 }
 
 export interface ApiCallArgs {
@@ -43,17 +43,13 @@ const MAX_UPLOAD = 5 * 1024 * 1024; // decoded bytes, per request
 const TIMEOUT_MS = 25_000;
 const KEEP_HEADERS = ["content-type", "link", "location", "retry-after", "etag", "x-request-id", "x-amzn-requestid", "x-ratelimit-remaining", "x-ratelimit-reset"];
 
-function parseHosts(env: ApiCallEnv): Record<string, string[]> {
-  try {
-    const m = JSON.parse(env.API_HOSTS || "{}");
-    return m && typeof m === "object" ? m : {};
-  } catch {
-    throw new Error("API_HOSTS config is not valid JSON");
-  }
+// Approved hosts for a secret: only what its own comment says (`hosts: a.com, *.b.com`).
+export function approvedHosts(comment?: string | null): string[] {
+  return commentHosts(comment);
 }
 
 export function hostAllowed(host: string, patterns: string[] | undefined): boolean {
-  if (!patterns) return false;
+  if (!patterns || patterns.length === 0) return false;
   const h = host.toLowerCase();
   return patterns.some((raw) => {
     const p = raw.toLowerCase();
@@ -80,20 +76,36 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
 
   const method = (a.method ?? "GET").toUpperCase();
   const authType = a.auth_type ?? "bearer";
-  const hosts = parseHosts(env);
-  const loc = { projectId: env.INFISICAL_PROJECT_ID, environment: a.environment ?? env.DEFAULT_ENVIRONMENT, secretPath: a.path ?? "/" };
+  const scope = { projectId: env.INFISICAL_PROJECT_ID, environment: a.environment ?? env.DEFAULT_ENVIRONMENT };
   const used: string[] = []; // secret values, for redaction
   const read = async (name: string) => {
-    if (!hostAllowed(url.hostname, hosts[name])) {
-      throw new Error(`Secret ${name} is not allowed to be sent to ${url.hostname}. Add it to API_HOSTS in wrangler.jsonc and redeploy.`);
+    // No path given: find the secret by name in any folder, but never guess between several.
+    let secretPath = a.path;
+    if (secretPath === undefined) {
+      const paths = await infisical.findSecretPaths(env, name, scope);
+      if (paths.length === 0) throw new Error(`Secret ${name} not found in environment ${scope.environment}`);
+      if (paths.length > 1) throw new Error(`Secret ${name} exists in several folders (${paths.join(", ")}); pass path to choose one`);
+      secretPath = paths[0];
     }
-    const v = await infisical.getSecretValue(env, name, loc);
-    used.push(v);
-    return v;
+    const secret = await infisical.getSecretValue(env, name, { ...scope, secretPath });
+    const approved = approvedHosts(secret.comment);
+    if (!hostAllowed(url.hostname, approved)) {
+      throw new Error(
+        `Secret ${name} is not allowed to be sent to ${url.hostname}. ` +
+        (approved.length ? `Approved hosts for it: ${approved.join(", ")}. ` : "No hosts are approved for it. ") +
+        "Hosts come from the secret's comment (a 'hosts: ...' line), are set when the secret is stored (add_secret hosts) and cannot be changed through this server; the owner can edit the comment in Infisical.",
+      );
+    }
+    used.push(secret.value);
+    return secret.value;
   };
 
   const headers = new Headers(a.headers ?? {});
   for (const h of ["host", "content-length", "connection", "proxy-authorization", "cookie"]) headers.delete(h);
+  // A POST that an API treats as DELETE would dodge the approval required for DELETE.
+  for (const h of ["x-http-method-override", "x-method-override", "x-http-method"]) {
+    if (headers.has(h)) throw new Error(`The ${h} header is not allowed`);
+  }
 
   const given = [a.body !== undefined && a.body !== null, !!a.body_base64, !!a.multipart].filter(Boolean).length;
   if (given > 1) throw new Error("Send only one of body, body_base64, multipart");
@@ -136,7 +148,7 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
     const secretKey = await read(a.aws_secret_key_secret ?? "AWS_SECRET_ACCESS_KEY");
     const tokenName = a.aws_session_token_secret ?? "AWS_SESSION_TOKEN";
     let sessionToken: string | undefined;
-    if (hosts[tokenName]) { try { sessionToken = await read(tokenName); } catch { /* optional */ } }
+    try { sessionToken = await read(tokenName); } catch { /* optional; also skipped if not approved for this host */ }
     const client = new AwsClient({
       accessKeyId: accessKey, secretAccessKey: secretKey, sessionToken,
       service: need(a.aws_service, "aws_service"), region: need(a.aws_region, "aws_region"),

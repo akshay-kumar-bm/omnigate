@@ -10,8 +10,11 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 - Infisical: US cloud (`https://us.infisical.com`), project id in `wrangler.jsonc`, default env `dev`.
 
 ## Layout
-- `src/index.ts`: builds the MCP server, registers tools, wires the OAuth provider (`/mcp`, `/authorize`, `/token`, `/register`).
+- `src/index.ts`: wires the OAuth provider (`/mcp`, `/authorize`, `/token`, `/register`) around the MCP server.
+- `src/server.ts`: the MCP server and its tools (no Cloudflare-only imports, so it runs under Node for tests).
 - `src/api-call.ts`: the `api_request` logic (auth types, host check, uploads, redaction).
+- `src/approvals.ts`: approval records (KV), the `/approve/*` pages, and the approval Google sign-in via `/callback` (state `ap.*`).
+- `src/hosts.ts`: validation and parsing of the `hosts:` comment line.
 - `src/infisical.ts`: thin Infisical REST client (Universal Auth). `getSecretValue` is server-side only.
 - `src/google-handler.ts`: Google sign-in, consent page, `/callback`. Bad OAuth params return 400, not a crash.
 - `wrangler.jsonc`: config vars and the KV binding. No separate config file.
@@ -22,9 +25,18 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 - Supporting: `list_environments`, `list_folders`, `list_secrets`, `get_secret`, `add_secret`, `update_secret`,
   `delete_secret` (needs `confirm: true`). These never return secret values.
 
-**Host binding:** a secret can only be sent to hosts listed for it in the `API_HOSTS` var in `wrangler.jsonc`
-(JSON, deny by default, `*.example.com` matches any depth). To add an integration: `add_secret` its token,
-add `"MY_TOKEN": ["api.example.com"]` to `API_HOSTS`, redeploy. Only the owner can change this.
+**Approvals:** `delete_secret`, `update_secret` (new value or name) and `api_request` with `DELETE` need a human: the first call
+returns `approval_required` + a link (`src/approvals.ts`); the user signs in with Google and approves; the repeat call with
+`approval_id` runs once, only for the exact same arguments, within 15 minutes. Never bypass or weaken this.
+
+**Folders:** secrets live in one Infisical folder per service (`/notion`, `/github`, `/linear`, `/tavily`, `/firecrawl`).
+`api_request` finds a secret by name in any folder (error if the name exists in several; pass `path`).
+
+**Host binding (deny by default):** a secret can only be sent to the hosts in its own comment, a `hosts: a.com, *.b.com`
+line, written by `add_secret`'s `hosts` argument and locked afterwards (`update_secret` preserves it and strips any
+`hosts:` in new comment text). No built-in list, no config var; no `hosts:` line means never sent. Wildcards need 2
+labels and are refused on shared-hosting domains. `${REF}` secret references are never expanded. Only the owner
+(Infisical dashboard) changes hosts on an existing secret.
 
 ## Run
 ```
@@ -41,8 +53,9 @@ own secrets are not part of a deploy.
 
 ## Test
 There is no test suite. Before pushing run `npm run typecheck`. To exercise `api_request` without OAuth, call
-`callApi` from `src/api-call.ts` in a throwaway script (e.g. `npx tsx x.mts`) using real Infisical credentials
-from the environment, and check status codes and redaction only. Check a deploy with:
+`callApi` from `src/api-call.ts`, or drive the real tools with `createServer` from `src/server.ts` and an in-memory MCP
+client (`InMemoryTransport` from `@modelcontextprotocol/client`), in a throwaway script (`npx tsx x.mts`, kept under the
+git-ignored `.wrangler/`) using real Infisical credentials from the environment; check status codes and redaction only. Check a deploy with:
 - `curl .../.well-known/oauth-authorization-server` returns 200.
 - `curl -i .../mcp` returns 401 with `WWW-Authenticate` (no token).
 - A bare `/authorize` or `/callback` returns 400 (expected; real clients send params).
@@ -51,6 +64,6 @@ The full flow (Google sign-in, tools) can only be checked from a Claude client c
 ## Rules
 - Never print, log or commit secret values or tokens. Report lengths or status codes instead.
 - Do not return raw secret values to the MCP client; do not follow redirects in `api_request`.
-- Only the owner widens `API_HOSTS` or `ALLOWED_EMAILS`; do not do it unprompted.
+- Only the owner widens a secret's `hosts:` comment or `ALLOWED_EMAILS`; do not do it unprompted.
 - Avoid renaming the Worker: that changes the URL and breaks the Google redirect URI and connectors.
 - Develop on the branch you are given; open a draft PR into `main`.
