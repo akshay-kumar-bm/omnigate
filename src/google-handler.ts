@@ -5,7 +5,18 @@ import type { Env } from "./index";
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
 export const GoogleHandler = {
+  // Bad or missing OAuth params make the provider helpers throw; answer 400 instead of crashing the Worker (error 1101).
   async fetch(req: Request, env: Env): Promise<Response> {
+    try {
+      return await handle(req, env);
+    } catch (e) {
+      console.error("oauth handler error", e instanceof Error ? e.message : e);
+      return new Response(`Bad request: ${e instanceof Error ? e.message : "invalid OAuth request"}`, { status: 400 });
+    }
+  },
+};
+
+async function handle(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
     const oauth = env.OAUTH_PROVIDER;
     const redirectUri = `${url.origin}/callback`;
@@ -72,5 +83,4 @@ export const GoogleHandler = {
     }
 
     return new Response("Not found", { status: 404 });
-  },
-};
+}
