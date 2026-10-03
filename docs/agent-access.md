@@ -44,7 +44,7 @@ Use a temporary token with "infisical run" instead (this is how it was tested he
 2. Ask the assistant for a token (issue_temp_token, use=aws_cli); you approve with the box ticked. Other uses: git_clone and github_cli (GITHUB_TOKEN from /github), infisical_run (anything else).
 3. Run, with the token it returns:
      export TOK='<token>'
-     infisical run --silent --token="$TOK" --domain=<infisical-host> --projectId=<project-id> --env=dev --path=/aws -- aws sts get-caller-identity
+     infisical run --silent --token="$INFISICAL_TOKEN" --domain=<infisical-host> --projectId=<project-id> --env=dev --path=/aws -- aws sts get-caller-identity
    "infisical run" puts the secrets into that one aws process only. Try "aws sts get-caller-identity" first, then your real command.
 Even better: an Infisical AWS IAM dynamic secret ("Temporary Credentials" mode, up to 12 hours) hands out short-lived AWS credentials instead of a stored key. Docs: https://infisical.com/docs/documentation/platform/dynamic-secrets/aws-iam (not tested here).
 ```

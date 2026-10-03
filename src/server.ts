@@ -332,7 +332,7 @@ export function createServer(env: Env) {
             environment,
             path,
             how_to_use: usage({ use: a.use as Use, host: env.INFISICAL_HOST, projectId: env.INFISICAL_PROJECT_ID, environment, path, command: a.command }),
-            reminder: "This is a secret. Do not print it, write it to a file, commit it or send it anywhere. It stops working when it expires.",
+            reminder: "Secret. Export it as INFISICAL_TOKEN once and reuse it until it expires; do not print or store it, and do not request a new one per command.",,
           });
         } catch (e) { return fail(e); }
       },
