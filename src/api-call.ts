@@ -1,4 +1,4 @@
-// call_api: make an authenticated HTTPS request using a stored secret, entirely server-side.
+// api_request: make an authenticated HTTPS request using a stored secret, entirely server-side.
 // The model supplies the secret NAME; the Worker reads the value from Infisical, injects it, calls the API
 // and returns only the response (with the secret redacted). A secret can only be sent to hosts listed for it
 // in the API_HOSTS config var, which only the Worker owner can change (redeploy), so a prompt-injected
@@ -167,7 +167,7 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
   const text = await res.text();
   const out: Record<string, string> = {};
   for (const k of KEEP_HEADERS) { const v = res.headers.get(k); if (v) out[k] = redact(v); }
-  console.log(JSON.stringify({ call_api: { host: url.hostname, method, status: res.status, auth: authType, upload_bytes: uploadBytes || undefined } }));
+  console.log(JSON.stringify({ api_request: { host: url.hostname, method, status: res.status, auth: authType, upload_bytes: uploadBytes || undefined } }));
   return {
     status: res.status,
     ok: res.ok,

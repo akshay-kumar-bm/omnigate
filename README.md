@@ -1,26 +1,26 @@
-# infisical-mcp
+# Universal API MCP server (infisical-mcp)
 
-Remote MCP server on Cloudflare Workers (free plan) for Infisical secrets, behind Google sign-in.
+One MCP server that lets Claude call **any HTTPS API or integration** (GitHub, Jira, Notion, Stripe, Slack, AWS, ...) with credentials kept in Infisical, so the model never sees a token. Runs on Cloudflare Workers (free plan) behind Google sign-in.
 
-Tools: `list_environments`, `list_folders`, `list_secrets`, `get_secret`, `add_secret`, `update_secret`, `delete_secret` (needs `confirm: true`), `call_api`.
+Main tool: **`api_request`**. Supporting tools for the credentials it uses: `list_environments`, `list_folders`, `list_secrets`, `get_secret`, `add_secret`, `update_secret`, `delete_secret` (needs `confirm: true`).
 
 **Values never come back to the client.** List/get use `viewSecretValue=false` and responses are redacted. `add_secret`/`update_secret` do pass the new value through the MCP client once.
 
-## Making API calls: `call_api`
-Connect this MCP to any Claude session and it can call any HTTPS API with a stored token without ever seeing the token. The model passes the secret *name*; the Worker reads the value from Infisical, adds the auth, calls the API and returns only the response (the token is redacted from it).
+## Making API calls: `api_request`
+Connect this MCP to any Claude session and it can call any HTTPS API or integration with a stored token without ever seeing the token. To connect a new integration: `add_secret` its token, add its host to `API_HOSTS`, redeploy. The model passes the secret *name*; the Worker reads the value from Infisical, adds the auth, calls the API and returns only the response (the token is redacted from it).
 
 ```
-call_api { url: "https://api.notion.com/v1/users/me", secret: "NOTION_TOKEN", headers: { "Notion-Version": "2022-06-28" } }
-call_api { url: "https://api.github.com/user", secret: "GH_TOKEN" }
-call_api { url: "https://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15", auth_type: "aws_sigv4", aws_service: "sts", aws_region: "us-east-1" }
+api_request { url: "https://api.notion.com/v1/users/me", secret: "NOTION_TOKEN", headers: { "Notion-Version": "2022-06-28" } }
+api_request { url: "https://api.github.com/user", secret: "GH_TOKEN" }
+api_request { url: "https://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15", auth_type: "aws_sigv4", aws_service: "sts", aws_region: "us-east-1" }
 ```
 `auth_type`: `bearer` (default), `header` (`header_name`, `header_prefix`), `basic` (`secret` = `user:pass`, or `username` + secret as password), `query` (`query_param`), `aws_sigv4` (uses the secrets `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`).
 
 **File uploads.** `multipart` sends a `multipart/form-data` form with files; `body_base64` sends raw bytes. Both take base64 data, up to 5 MB decoded per request, and cannot be combined with `body`. Example, uploading an image to a Notion row (the same two calls the Notion docs describe):
 ```
-1. call_api { url: "https://api.notion.com/v1/file_uploads", method: "POST", secret: "NOTION_TOKEN", headers: { "Notion-Version": "2022-06-28" }, body: { filename: "card.png", content_type: "image/png" } }          -> id
-2. call_api { url: "https://api.notion.com/v1/file_uploads/<id>/send", method: "POST", secret: "NOTION_TOKEN", headers: { "Notion-Version": "2022-06-28" }, multipart: { files: [{ filename: "card.png", content_type: "image/png", data_base64: "<...>" }] } }
-3. call_api { url: "https://api.notion.com/v1/pages/<page>", method: "PATCH", secret: "NOTION_TOKEN", headers: { "Notion-Version": "2022-06-28" }, body: { properties: { Image: { files: [{ name: "card.png", type: "file_upload", file_upload: { id: "<id>" } }] } } } }
+1. api_request { url: "https://api.notion.com/v1/file_uploads", method: "POST", secret: "NOTION_TOKEN", headers: { "Notion-Version": "2022-06-28" }, body: { filename: "card.png", content_type: "image/png" } }          -> id
+2. api_request { url: "https://api.notion.com/v1/file_uploads/<id>/send", method: "POST", secret: "NOTION_TOKEN", headers: { "Notion-Version": "2022-06-28" }, multipart: { files: [{ filename: "card.png", content_type: "image/png", data_base64: "<...>" }] } }
+3. api_request { url: "https://api.notion.com/v1/pages/<page>", method: "PATCH", secret: "NOTION_TOKEN", headers: { "Notion-Version": "2022-06-28" }, body: { properties: { Image: { files: [{ name: "card.png", type: "file_upload", file_upload: { id: "<id>" } }] } } } }
 ```
 S3: `PUT https://<bucket>.s3.<region>.amazonaws.com/<key>` with `auth_type: aws_sigv4`, `aws_service: s3` and `body_base64`.
 
