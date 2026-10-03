@@ -23,6 +23,7 @@ export interface Env {
   INFISICAL_CLIENT_SECRET: string;
   GOOGLE_CLIENT_ID: string;
   GOOGLE_CLIENT_SECRET: string;
+  AGENT_PROJECT_ID?: string; // project the agent identity reads (a separate, small project); defaults to INFISICAL_PROJECT_ID
   AGENT_INFISICAL_CLIENT_ID?: string; // optional: limited identity used only by issue_temp_token
   AGENT_INFISICAL_CLIENT_SECRET?: string;
   AGENT_TOKEN_MAX_SECONDS?: string; // optional cap on token lifetime, default 3600
@@ -276,6 +277,7 @@ export function createServer(env: Env) {
             });
           }
           const environment = a.environment ?? env.DEFAULT_ENVIRONMENT;
+          const projectId = env.AGENT_PROJECT_ID ?? env.INFISICAL_PROJECT_ID;
           // A token handed to an assistant must be short-lived. Its lifetime is set on the agent identity in Infisical, so log in
           // once up front (the probe token is thrown away, never shown) to learn it, refuse if it is too long, and show it to the human.
           const maxSeconds = Number(env.AGENT_TOKEN_MAX_SECONDS) > 0 ? Number(env.AGENT_TOKEN_MAX_SECONDS) : MAX_TOKEN_SECONDS_DEFAULT;
@@ -289,7 +291,7 @@ export function createServer(env: Env) {
             const probe = await mintAgentToken(env);
             if (!(probe.expiresIn > 0) || probe.expiresIn > maxSeconds) return ok(tooLong(probe.expiresIn));
             lifetime = `${duration(probe.expiresIn)}, then it stops working`;
-            access = await probeAccess(env, probe.accessToken, env.INFISICAL_PROJECT_ID, environment); // measured now, shown to the approver
+            access = await probeAccess(env, probe.accessToken, projectId, environment); // measured now, shown to the approver
             if (access.canWrite && env.AGENT_REQUIRE_READ_ONLY === "true") {
               return ok({ issued: false, reason: "The agent identity can change or delete secrets, and this server is set to hand out read-only tokens only (AGENT_REQUIRE_READ_ONLY). No token was issued. The owner should give the identity a read-only role in Infisical." });
             }
@@ -298,7 +300,7 @@ export function createServer(env: Env) {
             title: "Give the assistant a temporary Infisical token",
             risk: "token",
             rows: [
-              ["Purpose", a.purpose], ["Project", env.INFISICAL_PROJECT_ID], ["Environment", environment],
+              ["Purpose", a.purpose], ["Project", projectId], ["Environment", environment],
               ["Identity", `agent identity (client id ending ${String(env.AGENT_INFISICAL_CLIENT_ID).slice(-6)})`],
               ["Lifetime", lifetime],
               ...(access
@@ -323,9 +325,9 @@ export function createServer(env: Env) {
             expires_in_seconds: t.expiresIn,
             expires_at: new Date(Date.now() + t.expiresIn * 1000).toISOString(),
             infisical_host: env.INFISICAL_HOST,
-            project_id: env.INFISICAL_PROJECT_ID,
+            project_id: projectId,
             environment,
-            how_to_use: usage({ host: env.INFISICAL_HOST, projectId: env.INFISICAL_PROJECT_ID, environment }),
+            how_to_use: usage({ host: env.INFISICAL_HOST, projectId, environment }),
             reminder: "Secret. Set it once as the global INFISICAL_TOKEN (see how_to_use) and reuse it until it expires; do not print it, and do not request a new one per command.",
           });
         } catch (e) { return fail(e); }

@@ -26,7 +26,7 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 - **`api_request`** (main): authenticated HTTPS call. `auth_type`: bearer (default), header, basic, query,
   aws_sigv4. Uploads: `multipart` or `body_base64` (5 MB cap). Redirects are not followed.
 - `issue_temp_token`: short-lived Infisical token (limited agent identity) for CLIs like aws; ALWAYS needs approval with a
-  must-tick "give token" box; refuses lifetimes over 1 h; shows the identity's measured access (read scope, can it write?). `access_guide`: setup text only. See `docs/agent-access.md`.
+  must-tick "give token" box; refuses lifetimes over 1 h; shows the identity's measured access (read scope, can it write?). The agent identity belongs only to a separate small project (`AGENT_PROJECT_ID`, "cli-secrets"), not the main one: Infisical's plan has no per-folder roles, so a separate project is the only way to limit what a token can read. `access_guide`: setup text only. See `docs/agent-access.md`.
 - Supporting: `list_environments`, `list_folders`, `list_secrets`, `get_secret`, `add_secret`, `update_secret`,
   `delete_secret` (needs `confirm: true`). These never return secret values.
 
