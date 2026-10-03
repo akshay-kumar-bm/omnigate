@@ -11,7 +11,7 @@
     "DEFAULT_ENVIRONMENT": "dev",
     "ALLOWED_EMAILS": "akshaykumarbedre.bm@gmail.com",
     "PLACEHOLDER_PREFIX": "infisical-agent-proxy",
-    "PUBLIC_URL": "https://infisical-mcp.REPLACE_SUBDOMAIN.workers.dev"
+    "PUBLIC_URL": "https://infisical-mcp.shipengine-ai.workers.dev"
   },
   "observability": { "enabled": true }
 }
