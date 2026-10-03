@@ -7,7 +7,7 @@
   "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "REPLACE_WITH_KV_ID" }],
   "vars": {
     "INFISICAL_HOST": "https://us.infisical.com",
-    "INFISICAL_PROJECT_ID": "REPLACE_WITH_PROJECT_ID",
+    "INFISICAL_PROJECT_ID": "e550c9ba-7757-4c6f-a3c2-ca83e8ec20b3",
     "DEFAULT_ENVIRONMENT": "dev",
     "ALLOWED_EMAILS": "akshaykumarbedre.bm@gmail.com",
     "PLACEHOLDER_PREFIX": "infisical-agent-proxy",
