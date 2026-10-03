@@ -1,0 +1,24 @@
+{
+  "name": "infisical-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "cf-typegen": "wrangler types"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "latest",
+    "@modelcontextprotocol/client": "^2.0.0",
+    "@modelcontextprotocol/server": "2.0.0",
+    "agents": "latest",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "latest",
+    "typescript": "^5.6.0",
+    "wrangler": "latest"
+  }
+}
