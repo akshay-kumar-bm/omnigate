@@ -23,3 +23,31 @@ export async function mintAgentToken(env: AgentTokenEnv): Promise<{ accessToken:
   if (!j.accessToken) throw new Error("Infisical returned no access token");
   return { accessToken: j.accessToken, expiresIn: j.expiresIn ?? 0, tokenType: j.tokenType ?? "Bearer" };
 }
+
+export interface AccessSummary {
+  folders: { path: string; count: number }[];
+  total: number;
+  canWrite: boolean | null; // null = could not tell
+}
+
+// Measures what a freshly minted token can really do, so the person approving sees facts instead of a generic warning.
+// Reading is listed with values hidden. Writing is probed by deleting a secret that does not exist: Infisical answers
+// 403 if the identity may not delete and 404 if it may, and nothing is ever deleted or changed.
+export async function probeAccess(env: { INFISICAL_HOST: string }, token: string, projectId: string, environment: string): Promise<AccessSummary> {
+  const h = { authorization: `Bearer ${token}` };
+  const q = new URLSearchParams({ projectId, environment, secretPath: "/", recursive: "true", viewSecretValue: "false", expandSecretReferences: "false", includeImports: "false" });
+  const r = await fetch(`${env.INFISICAL_HOST}/api/v4/secrets?${q}`, { headers: h });
+  const secrets: { secretPath?: string }[] = r.ok ? ((await r.json()) as any).secrets ?? [] : [];
+  const byPath = new Map<string, number>();
+  for (const x of secrets) byPath.set(x.secretPath ?? "/", (byPath.get(x.secretPath ?? "/") ?? 0) + 1);
+  const folders = [...byPath].map(([path, count]) => ({ path, count })).sort((a, b) => a.path.localeCompare(b.path));
+  let canWrite: boolean | null = r.ok ? false : null;
+  for (const path of ["/", ...folders.map((f) => f.path)].slice(0, 12)) {
+    const d = await fetch(`${env.INFISICAL_HOST}/api/v4/secrets/ZZ_ACCESS_PROBE_${crypto.randomUUID().slice(0, 8)}`, {
+      method: "DELETE", headers: { ...h, "content-type": "application/json" }, body: JSON.stringify({ projectId, environment, secretPath: path, type: "shared" }),
+    });
+    if (d.status === 404) { canWrite = true; break; } // allowed to delete, there was just nothing by that name
+    if (d.status !== 403 && d.status !== 400) canWrite = canWrite === false ? null : canWrite;
+  }
+  return { folders, total: secrets.length, canWrite };
+}

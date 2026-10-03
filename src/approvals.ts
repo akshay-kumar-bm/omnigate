@@ -15,7 +15,7 @@ type ApprovalEnv = Pick<Env, "OAUTH_KV" | "APPROVAL_STORE" | "PUBLIC_URL" | "GOO
 export interface ApprovalSpec {
   title: string;
   risk?: "danger" | "token";
-  rows: [label: string, value: string][];
+  rows: ([label: string, value: string] | [label: string, value: string, flag: "warn"])[];
   ack?: string;
 }
 
@@ -24,7 +24,7 @@ interface ApprovalRecord {
   tool: string;
   title?: string;
   risk?: "danger" | "token";
-  rows?: [string, string][];
+  rows?: ([string, string] | [string, string, "warn"])[];
   ack?: string;
   summary: string[]; // plain-text version of the rows; also what older records contain
   fp: string;
@@ -86,7 +86,7 @@ export async function requestApproval(env: ApprovalEnv, tool: string, args: Reco
   const id = rand();
   await save(env, {
     id, tool, title: spec.title, risk: spec.risk, rows: spec.rows, ack: spec.ack,
-    summary: [spec.title, ...spec.rows.map(([k, v]) => `${k}: ${v}`)],
+    summary: [spec.title, ...spec.rows.map((x) => `${x[0]}: ${x[1]}`)],
     fp: await fingerprint(tool, args), status: "pending", created: Date.now(),
   });
   return { id, url: approvalUrl(env, id), expiresInMinutes: TTL_SECONDS / 60 };
@@ -129,6 +129,8 @@ h1{margin:2px 0 0;font-size:1.35rem;line-height:1.25}
 .rows div:first-child{border-top:0}
 dt{color:var(--mute);font-size:.85rem;padding-top:1px}
 dd{margin:0;font:.9rem ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}
+.rows .warn{background:color-mix(in srgb,var(--danger) 10%,transparent)}
+.rows .warn dd{color:var(--danger);font-weight:700}
 .meta{font-size:.85rem;color:var(--mute);margin:8px 0 0}
 .ack{display:flex;gap:12px;align-items:flex-start;padding:14px;border:2px solid var(--tone);border-radius:12px;margin:16px 0 0;cursor:pointer}
 .ack input{flex:none;width:22px;height:22px;margin:2px 0 0;accent-color:var(--tone)}
@@ -156,12 +158,12 @@ const shell = (title: string, tone: Tone, inner: string, status = 200, extra: Re
     { status, headers: { ...PAGE_HEADERS, ...extra } },
   );
 
-const rowsOf = (r: ApprovalRecord): [string, string][] =>
+const rowsOf = (r: ApprovalRecord): ([string, string] | [string, string, "warn"])[] =>
   r.rows ?? r.summary.map((l) => { const i = l.indexOf(": "); return (i > 0 ? [l.slice(0, i), l.slice(i + 2)] : ["", l]) as [string, string]; });
 const titleOf = (r: ApprovalRecord) => r.title ?? "Approve this action?";
 const toneOf = (r: ApprovalRecord): Tone => r.risk ?? "danger";
 const rowsHtml = (r: ApprovalRecord) =>
-  `<dl class=rows>${rowsOf(r).map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join("")}</dl>`;
+  `<dl class=rows>${rowsOf(r).map((x) => `<div${x[2] === "warn" ? " class=warn" : ""}><dt>${esc(x[0])}</dt><dd>${esc(x[1])}</dd></div>`).join("")}</dl>`;
 const hhmm = (ms: number) => new Date(ms).toISOString().slice(11, 16) + " UTC";
 
 const message = (title: string, tone: Tone, body: string, status = 200, extra: Record<string, string> = {}) =>

@@ -3,7 +3,7 @@ import { z } from "zod";
 import { infisical, redact } from "./infisical";
 import { approvedHosts, callApi } from "./api-call";
 import { checkApproval, requestApproval, type ApprovalSpec } from "./approvals";
-import { agentConfigured, mintAgentToken } from "./temp-token";
+import { agentConfigured, mintAgentToken, probeAccess, type AccessSummary } from "./temp-token";
 import { fullGuide, guide, usage, type Topic, type Use } from "./guide";
 import { destructiveReason } from "./destructive";
 import { buildComment, commentHosts } from "./hosts";
@@ -26,6 +26,7 @@ export interface Env {
   AGENT_INFISICAL_CLIENT_ID?: string; // optional: limited identity used only by issue_temp_token
   AGENT_INFISICAL_CLIENT_SECRET?: string;
   AGENT_TOKEN_MAX_SECONDS?: string; // optional cap on token lifetime, default 3600
+  AGENT_REQUIRE_READ_ONLY?: string; // "true" = refuse to issue a token if the agent identity can change or delete secrets
 }
 
 const ok = (data: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] });
@@ -287,10 +288,15 @@ export function createServer(env: Env) {
             reason: `The agent identity issues tokens that live ${duration(sec)}, longer than the ${duration(maxSeconds)} allowed for a token handed to an assistant. No token was issued. The owner should set the identity's Access Token TTL and Max TTL in Infisical to ${duration(maxSeconds)} or less.`,
           });
           let lifetime = "Checked when you approve";
+          let access: AccessSummary | undefined;
           if (typeof a.approval_id !== "string") {
             const probe = await mintAgentToken(env);
             if (!(probe.expiresIn > 0) || probe.expiresIn > maxSeconds) return ok(tooLong(probe.expiresIn));
             lifetime = `${duration(probe.expiresIn)}, then it stops working`;
+            access = await probeAccess(env, probe.accessToken, env.INFISICAL_PROJECT_ID, environment); // measured now, shown to the approver
+            if (access.canWrite && env.AGENT_REQUIRE_READ_ONLY === "true") {
+              return ok({ issued: false, reason: "The agent identity can change or delete secrets, and this server is set to hand out read-only tokens only (AGENT_REQUIRE_READ_ONLY). No token was issued. The owner should give the identity a read-only role in Infisical." });
+            }
           }
           const useLabel = { aws_cli: "Running the AWS CLI", git_clone: "Cloning repositories with git", github_cli: "Running the GitHub CLI", infisical_run: "Running a command with `infisical run`", rest_api: "Calling the Infisical API" }[a.use];
           const held = await gate("issue_temp_token", a, {
@@ -300,7 +306,15 @@ export function createServer(env: Env) {
               ["Purpose", a.purpose], ["Will be used for", useLabel], ...(a.command ? [["Command", a.command] as [string, string]] : []), ["Project", env.INFISICAL_PROJECT_ID], ["Environment", environment], ["Folder", path],
               ["Identity", `agent identity (client id ending ${String(env.AGENT_INFISICAL_CLIENT_ID).slice(-6)})`],
               ["Lifetime", lifetime],
-              ["Access", "Whatever that identity is allowed to read in Infisical. The folder above is only where the assistant plans to look; it is not a limit."],
+              ...(access
+                ? ([
+                    ["Can read", access.total === 0 ? "Nothing in this environment" : `${access.total} secret${access.total === 1 ? "" : "s"} in ${access.folders.length} folder${access.folders.length === 1 ? "" : "s"} of ${environment}: ${access.folders.map((f) => `${f.path} (${f.count})`).join(", ")}`],
+                    access.canWrite
+                      ? ["Can change or delete", "YES (tested). With this token the assistant could overwrite or delete these secrets without asking you again.", "warn"]
+                      : ["Can change or delete", access.canWrite === false ? "No (tested): read-only" : "Could not be tested"],
+                    ["Note", `The folder above only selects which secrets \`infisical run\` puts into the command. The token itself can use everything listed under "Can read".`],
+                  ] as ApprovalSpec["rows"])
+                : []),
             ],
             ack: "Yes, give the assistant a temporary Infisical token. I understand it can read whatever the agent identity is allowed to read until it expires.",
           });
