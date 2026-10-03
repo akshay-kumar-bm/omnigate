@@ -87,13 +87,23 @@ function createServer(env: Env) {
           "Make an authenticated HTTPS API call using a stored secret without ever seeing it. Pass the secret NAME; the server reads the token, adds the auth, calls the API and returns the response. " +
           "A secret can only be sent to hosts listed for it in the server's API_HOSTS config (otherwise the call is refused). Redirects are not followed. " +
           "auth_type: bearer (default; Authorization: Bearer <secret>), header (header_name + optional header_prefix), basic (secret = 'user:pass', or username + secret as password), query (query_param), " +
-          "aws_sigv4 (signs with secrets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / optional AWS_SESSION_TOKEN; needs aws_service and aws_region). Do not send your own Authorization header.",
+          "file uploads: body_base64 (raw bytes) or multipart (form with files), up to 5 MB; aws_sigv4 (signs with secrets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / optional AWS_SESSION_TOKEN; needs aws_service and aws_region). Do not send your own Authorization header.",
         inputSchema: z.object({
           url: z.string().url().describe("Full https:// URL"),
           method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]).default("GET"),
           headers: z.record(z.string(), z.string()).optional().describe("Extra request headers (e.g. Notion-Version, Accept)"),
           query: z.record(z.string(), z.string()).optional().describe("Query string params"),
           body: z.union([z.string(), z.record(z.string(), z.unknown()), z.array(z.unknown())]).optional().describe("Request body; objects/arrays are sent as JSON"),
+          body_base64: z.string().optional().describe("Raw binary request body as base64 (max 5 MB decoded), e.g. PUT an object to S3. Set Content-Type in headers. Use instead of body."),
+          multipart: z.object({
+            fields: z.record(z.string(), z.string()).optional().describe("Plain form fields, sent before the files"),
+            files: z.array(z.object({
+              field: z.string().default("file").describe("Form field name, default 'file'"),
+              filename: z.string(),
+              content_type: z.string().optional().describe("e.g. image/png"),
+              data_base64: z.string().describe("File bytes as base64"),
+            })).min(1),
+          }).optional().describe("multipart/form-data upload (max 5 MB total decoded), e.g. Notion /v1/file_uploads/{id}/send. Use instead of body. Not for aws_sigv4."),
           auth_type: z.enum(["bearer", "header", "basic", "query", "aws_sigv4"]).default("bearer"),
           secret: secretName.optional().describe("Name of the secret holding the token / API key (not needed for aws_sigv4)"),
           header_name: z.string().optional(),

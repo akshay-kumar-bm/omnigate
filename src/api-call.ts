@@ -21,6 +21,8 @@ export interface ApiCallArgs {
   headers?: Record<string, string>;
   query?: Record<string, string>;
   body?: unknown;
+  body_base64?: string; // raw binary request body (e.g. PUT an object to S3)
+  multipart?: { fields?: Record<string, string>; files: { field?: string; filename: string; content_type?: string; data_base64: string }[] };
   auth_type?: "bearer" | "header" | "basic" | "query" | "aws_sigv4";
   secret?: string;
   header_name?: string;
@@ -37,6 +39,7 @@ export interface ApiCallArgs {
 }
 
 const MAX_BODY = 60_000;
+const MAX_UPLOAD = 5 * 1024 * 1024; // decoded bytes, per request
 const TIMEOUT_MS = 25_000;
 const KEEP_HEADERS = ["content-type", "link", "location", "retry-after", "etag", "x-request-id", "x-amzn-requestid", "x-ratelimit-remaining", "x-ratelimit-reset"];
 
@@ -56,6 +59,16 @@ export function hostAllowed(host: string, patterns: string[] | undefined): boole
     const p = raw.toLowerCase();
     return p.startsWith("*.") ? h.endsWith(p.slice(1)) && h.length > p.length - 1 : h === p;
   });
+}
+
+function decodeBase64(b64: string): Uint8Array {
+  const clean = b64.replace(/\s+/g, "");
+  if (Math.floor((clean.length * 3) / 4) > MAX_UPLOAD + 3) throw new Error(`Upload too large (max ${MAX_UPLOAD / 1024 / 1024} MB)`);
+  let bin: string;
+  try { bin = atob(clean); } catch { throw new Error("data is not valid base64"); }
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
 }
 
 export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown> {
@@ -82,13 +95,31 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
   const headers = new Headers(a.headers ?? {});
   for (const h of ["host", "content-length", "connection", "proxy-authorization", "cookie"]) headers.delete(h);
 
-  let body: string | undefined;
+  const given = [a.body !== undefined && a.body !== null, !!a.body_base64, !!a.multipart].filter(Boolean).length;
+  if (given > 1) throw new Error("Send only one of body, body_base64, multipart");
+  let body: string | Uint8Array | FormData | undefined;
+  let uploadBytes = 0;
   if (a.body !== undefined && a.body !== null) {
     if (typeof a.body === "string") body = a.body;
     else {
       body = JSON.stringify(a.body);
       if (!headers.has("content-type")) headers.set("content-type", "application/json");
     }
+  } else if (a.body_base64) {
+    body = decodeBase64(a.body_base64);
+    uploadBytes = body.length;
+  } else if (a.multipart) {
+    if (a.auth_type === "aws_sigv4") throw new Error("multipart is not supported with aws_sigv4; use body_base64");
+    const fd = new FormData();
+    for (const [k, v] of Object.entries(a.multipart.fields ?? {})) fd.append(k, v);
+    for (const f of a.multipart.files) {
+      const bytes = decodeBase64(f.data_base64);
+      uploadBytes += bytes.length;
+      if (uploadBytes > MAX_UPLOAD) throw new Error(`Upload too large (max ${MAX_UPLOAD / 1024 / 1024} MB in total)`);
+      fd.append(f.field ?? "file", new Blob([bytes], { type: f.content_type ?? "application/octet-stream" }), f.filename);
+    }
+    headers.delete("content-type"); // fetch sets multipart/form-data with the boundary
+    body = fd;
   }
 
   const need = (v: string | undefined, what: string) => {
@@ -110,7 +141,7 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
       accessKeyId: accessKey, secretAccessKey: secretKey, sessionToken,
       service: need(a.aws_service, "aws_service"), region: need(a.aws_region, "aws_region"),
     });
-    req = await client.sign(url.toString(), { method, headers, body });
+    req = await client.sign(url.toString(), { method, headers, body: body as BodyInit | undefined });
   } else {
     const value = await read(need(a.secret, "secret"));
     if (authType === "bearer") { injected("authorization"); headers.set("authorization", `Bearer ${value}`); }
@@ -127,7 +158,7 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
     } else if (authType === "query") {
       url.searchParams.set(need(a.query_param, "query_param"), value);
     } else throw new Error(`Unknown auth_type ${authType}`);
-    req = new Request(url.toString(), { method, headers, body: method === "GET" || method === "HEAD" ? undefined : body });
+    req = new Request(url.toString(), { method, headers, body: method === "GET" || method === "HEAD" ? undefined : (body as BodyInit | undefined) });
   }
 
   // Never follow redirects: the next hop could be a host the secret is not bound to.
@@ -136,7 +167,7 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
   const text = await res.text();
   const out: Record<string, string> = {};
   for (const k of KEEP_HEADERS) { const v = res.headers.get(k); if (v) out[k] = redact(v); }
-  console.log(JSON.stringify({ call_api: { host: url.hostname, method, status: res.status, auth: authType } }));
+  console.log(JSON.stringify({ call_api: { host: url.hostname, method, status: res.status, auth: authType, upload_bytes: uploadBytes || undefined } }));
   return {
     status: res.status,
     ok: res.ok,
