@@ -37,6 +37,14 @@ S3: `PUT https://<bucket>.s3.<region>.amazonaws.com/<key>` with `auth_type: aws_
 - Secrets are read from `DEFAULT_ENVIRONMENT` (`dev`) unless `environment` is passed. Keep one Infisical folder per service (`/notion`, `/github`, ...): `api_request` finds a secret by name in any folder, refuses to guess if the same name is in several (pass `path`), and `list_secrets` searches all folders by default. `add_secret` takes `path` to choose the folder.
 - This is not a shell: it cannot run CLIs like `aws` or `gh`. For those, use `infisical run --env=dev -- <cmd>` in a session that has the Infisical CLI.
 
+## Approval for destructive actions
+These always need a human, enforced by the server (not by the model): `delete_secret`, `update_secret` with a new value or name, and `api_request` with method `DELETE`. Everything else (reads, creates, other writes, comment-only edits) runs automatically.
+1. The first call returns `approval_required` with an `approve_url` and does nothing.
+2. The user opens the link, signs in with Google (an account in `ALLOWED_EMAILS`) and presses **Approve** (or **Deny**). A model can't do this: it needs the Google sign-in and a one-time nonce that only that browser receives.
+3. The model repeats the identical call with `approval_id`. The approval is bound to the exact tool and arguments (a different URL, name or body is refused), works once, and expires after 15 minutes.
+
+Limits: only the actions above are gated. A destructive call made with `POST`/`PATCH` (for example a GraphQL delete mutation or Notion `archived: true`) is not detected, and method-override headers are refused so they can't disguise a `DELETE`.
+
 ## Deploy
 Pushes to `main` deploy automatically via GitHub Actions (`.github/workflows/deploy.yml`; repo secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`). The steps below are the one-time setup and the manual route.
 1. `npm install --legacy-peer-deps`

@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { infisical, redact } from "./infisical";
 import { approvedHosts, callApi } from "./api-call";
+import { checkApproval, requestApproval } from "./approvals";
 import { buildComment, commentHosts } from "./hosts";
 
 export interface Env {
@@ -30,6 +31,7 @@ const INSTRUCTIONS = [
   "Use api_request for the call itself: pass the secret NAME plus the URL, method and body; the server adds the token and returns the response with the token redacted.",
   "Use list_secrets to see which credentials exist (names, approved hosts; never values) and add_secret to store a new one. A secret can only be sent to the hosts in its own comment (a 'hosts: ...' line, shown as approved_hosts). When you store a token with add_secret you MUST pass hosts, the API's hostnames, e.g. [\"api.linear.app\"] or [\"*.atlassian.net\"] (no scheme or path); look up the service's API host if you are unsure. Hosts are fixed when the secret is created and cannot be changed through this server, so get them right the first time; only the owner can change them later. If api_request says a host is not allowed, tell the user.",
   "Secrets are organised in one folder per service (e.g. /notion/NOTION_TOKEN). api_request finds a secret by name in any folder; pass path only if the same name exists in several. When you add a token, put it in its own folder with path (e.g. /linear).",
+  "Destructive actions always need the user's approval, enforced by the server: delete_secret, update_secret with a new value or name, and api_request with method DELETE. The first call returns approval_required with a link; give the link to the user, wait until they say they approved it, then repeat the identical call with approval_id. An approval works once, for that exact action, for 15 minutes. Never try to work around it.",
   "Never ask the user to paste a token into the chat if it can be stored with add_secret, and never try to read secret values back.",
 ].join("\n");
 
@@ -49,6 +51,20 @@ export function createServer(env: Env) {
       environment: a.environment ?? env.DEFAULT_ENVIRONMENT,
       secretPath: a.path ?? "/",
     });
+    // Destructive actions: first call returns a link for the human; the repeat call carries approval_id.
+    const gate = async (tool: string, args: Record<string, unknown>, summary: string[]) => {
+      const approvalId = typeof args.approval_id === "string" ? args.approval_id : undefined;
+      if (approvalId) {
+        const c = await checkApproval(env, approvalId, tool, args);
+        return c.ok ? null : fail(new Error(c.reason));
+      }
+      const r = await requestApproval(env, tool, args, summary);
+      return ok({
+        approval_required: true, approval_id: r.id, approve_url: r.url, expires_in_minutes: r.expiresInMinutes, action: summary,
+        next_step: `Tell the user to open approve_url, sign in with Google and press Approve. After they confirm, call ${tool} again with exactly the same arguments plus approval_id. Do not repeat the call before they confirm.`,
+      });
+    };
+    const approvalField = { approval_id: z.string().optional().describe("From an earlier approval_required response, after the user approved it") };
     const loc = {
       environment: z.string().optional().describe("Environment slug (default from config, e.g. dev)"),
       path: z.string().optional().describe("Folder path, default /"),
@@ -61,7 +77,7 @@ export function createServer(env: Env) {
           "Pass the secret NAME (see list_secrets); the server reads the token, adds the auth, calls the API and returns the response with the token redacted. " +
           "A secret can only be sent to the hosts in its own comment (the hosts given to add_secret; see approved_hosts in list_secrets), otherwise the call is refused and the error lists the approved hosts. Redirects are not followed. " +
           "auth_type: bearer (default; Authorization: Bearer <secret>), header (header_name + optional header_prefix), basic (secret = 'user:pass', or username + secret as password), query (query_param), " +
-          "file uploads: body_base64 (raw bytes) or multipart (form with files), up to 5 MB; aws_sigv4 (signs with secrets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / optional AWS_SESSION_TOKEN; needs aws_service and aws_region). Do not send your own Authorization header.",
+          "file uploads: body_base64 (raw bytes) or multipart (form with files), up to 5 MB; aws_sigv4 (signs with secrets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / optional AWS_SESSION_TOKEN; needs aws_service and aws_region). Do not send your own Authorization header. Method DELETE always needs the user's approval: the first call returns an approval link, and you repeat the call with approval_id once they approve.",
         inputSchema: z.object({
           url: z.string().url().describe("Full https:// URL"),
           method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]).default("GET"),
@@ -90,11 +106,23 @@ export function createServer(env: Env) {
           aws_secret_key_secret: secretName.optional().describe("default AWS_SECRET_ACCESS_KEY"),
           aws_session_token_secret: secretName.optional().describe("default AWS_SESSION_TOKEN"),
           ...loc,
+          ...approvalField,
           path: z.string().optional().describe("Folder of the secret, e.g. /notion. If omitted, the secret is found by name in any folder (an error if the name exists in several)."),
         }),
       },
       async (a) => {
-        try { return ok(await callApi(env, a)); } catch (e) { return fail(e); }
+        try {
+          if (a.method === "DELETE") {
+            const preview = typeof a.body === "string" ? a.body : a.body !== undefined ? JSON.stringify(a.body) : "";
+            const held = await gate("api_request", a, [
+              `DELETE ${a.url}`, `Credential: ${a.secret ?? "AWS keys"} (${a.auth_type})`,
+              ...(a.query ? [`Query: ${JSON.stringify(a.query)}`] : []),
+              ...(preview ? [`Body: ${preview.slice(0, 300)}${preview.length > 300 ? "..." : ""}`] : []),
+            ]);
+            if (held) return held;
+          }
+          return ok(await callApi(env, a));
+        } catch (e) { return fail(e); }
       },
     );
 
@@ -163,14 +191,22 @@ export function createServer(env: Env) {
 
     server.registerTool(
       "update_secret",
-      { description: "Update a secret's value, comment (free-text note), or name. The value is not echoed back. The approved hosts (the 'hosts:' line in the comment) are kept as they are and cannot be changed here.", inputSchema: z.object({
+      { description: "Update a secret's value, comment (free-text note), or name. The value is not echoed back. The approved hosts (the 'hosts:' line in the comment) are kept as they are and cannot be changed here. Changing the value or the name overwrites the secret and needs the user's approval: the first call returns an approval link, and you repeat the call with approval_id once they approve. Changing only the comment needs no approval.", inputSchema: z.object({
         name: secretName, value: z.string().min(1).optional(), comment: z.string().optional(),
-        new_name: secretName.optional(), ...loc,
+        new_name: secretName.optional(), ...loc, ...approvalField,
       }) },
       async (a) => {
         try {
           if (a.value === undefined && a.comment === undefined && a.new_name === undefined) throw new Error("Nothing to update");
           const b = base(a);
+          if (a.value !== undefined || a.new_name !== undefined) {
+            const held = await gate("update_secret", a, [
+              `Update secret ${a.name}`, `Environment: ${b.environment}`, `Folder: ${b.secretPath}`,
+              ...(a.value !== undefined ? ["Overwrite its value (the old value cannot be recovered through this server)"] : []),
+              ...(a.new_name !== undefined ? [`Rename it to ${a.new_name}`] : []),
+            ]);
+            if (held) return held;
+          }
           // Always send the comment back: Infisical clears it when omitted, which would also drop the approved hosts.
           const existing = (await infisical.getSecret(env, a.name, b)).secret?.secretComment ?? "";
           const body: Record<string, unknown> = { ...b, secretComment: a.comment !== undefined ? buildComment(commentHosts(existing), a.comment) : existing };
@@ -184,10 +220,12 @@ export function createServer(env: Env) {
 
     server.registerTool(
       "delete_secret",
-      { description: "Permanently delete a secret. Requires confirm=true.", inputSchema: z.object({ name: secretName, confirm: z.literal(true).describe("Must be true"), ...loc }) },
+      { description: "Permanently delete a secret. Always needs the user's approval: the first call returns an approval link for the user, and you repeat the call with approval_id once they approve.", inputSchema: z.object({ name: secretName, confirm: z.literal(true).describe("Must be true"), ...loc, ...approvalField }) },
       async (a) => {
         try {
           const b = base(a);
+          const held = await gate("delete_secret", a, ["Permanently delete secret", `Name: ${a.name}`, `Environment: ${b.environment}`, `Folder: ${b.secretPath}`]);
+          if (held) return held;
           await infisical.deleteSecret(env, a.name, b);
           return ok({ deleted: a.name, environment: b.environment, path: b.secretPath });
         } catch (e) { return fail(e); }

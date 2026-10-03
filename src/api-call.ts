@@ -102,6 +102,10 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
 
   const headers = new Headers(a.headers ?? {});
   for (const h of ["host", "content-length", "connection", "proxy-authorization", "cookie"]) headers.delete(h);
+  // A POST that an API treats as DELETE would dodge the approval required for DELETE.
+  for (const h of ["x-http-method-override", "x-method-override", "x-http-method"]) {
+    if (headers.has(h)) throw new Error(`The ${h} header is not allowed`);
+  }
 
   const given = [a.body !== undefined && a.body !== null, !!a.body_base64, !!a.multipart].filter(Boolean).length;
   if (given > 1) throw new Error("Send only one of body, body_base64, multipart");

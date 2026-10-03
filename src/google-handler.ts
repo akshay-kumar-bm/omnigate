@@ -1,5 +1,6 @@
 // Google sign-in behind the Workers OAuth provider. Only emails in ALLOWED_EMAILS get a token.
 // Uses the library's consent/upstream helpers (CSRF-bound consent, bound state, no framing).
+import { finishApprovalSignIn, handleApprovalRequest } from "./approvals";
 import type { Env } from "./index";
 
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
@@ -20,6 +21,11 @@ async function handle(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
     const oauth = env.OAUTH_PROVIDER;
     const redirectUri = `${url.origin}/callback`;
+
+    // Human approval of destructive actions (see approvals.ts). Its Google sign-in returns to /callback with state "ap.*".
+    const approval = await handleApprovalRequest(req, env);
+    if (approval) return approval;
+    if (url.pathname === "/callback" && (url.searchParams.get("state") ?? "").startsWith("ap.")) return finishApprovalSignIn(req, env);
 
     if (url.pathname === "/authorize" && req.method === "GET") {
       const request = await oauth.parseAuthRequest(req);
