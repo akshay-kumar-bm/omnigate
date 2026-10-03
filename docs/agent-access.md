@@ -41,9 +41,9 @@ Running the AWS CLI with Infisical secrets
 Do NOT route the AWS CLI through the Agent Proxy. The docs describe header rewrites and placeholder substitution only, and the AWS CLI signs each request (SigV4) with the secret key on the client, so a placeholder key produces a signature the proxy cannot fix. This is my reading of the docs, not something I tested.
 Use a temporary token with "infisical run" instead (this is how it was tested here):
 1. Store the AWS credentials in a folder, e.g. /aws in dev: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION (and AWS_SESSION_TOKEN if you use temporary ones). Use an IAM user or role with the least rights that work.
-2. Ask the assistant for a token (issue_temp_token, use=aws_cli); you approve with the box ticked. Other uses: git_clone and github_cli (GITHUB_TOKEN from /github), infisical_run (anything else).
+2. Ask the assistant for a token (issue_temp_token); you approve with the box ticked.
 3. Run, with the token it returns:
-     export TOK='<token>'
+     export INFISICAL_TOKEN='<token>'
      infisical run --silent --domain=<infisical-host> --projectId=<project-id> --env=dev --path=/aws -- aws sts get-caller-identity
    "infisical run" puts the secrets into that one aws process only. Try "aws sts get-caller-identity" first, then your real command.
 Even better: an Infisical AWS IAM dynamic secret ("Temporary Credentials" mode, up to 12 hours) hands out short-lived AWS credentials instead of a stored key. Docs: https://infisical.com/docs/documentation/platform/dynamic-secrets/aws-iam (not tested here).
