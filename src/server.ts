@@ -2,7 +2,9 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { infisical, redact } from "./infisical";
 import { approvedHosts, callApi } from "./api-call";
-import { checkApproval, requestApproval } from "./approvals";
+import { checkApproval, requestApproval, type ApprovalSpec } from "./approvals";
+import { agentConfigured, mintAgentToken, probeAccess, type AccessSummary } from "./temp-token";
+import { fullGuide, guide, usage, type Topic, type Use } from "./guide";
 import { destructiveReason } from "./destructive";
 import { buildComment, commentHosts } from "./hosts";
 
@@ -21,6 +23,10 @@ export interface Env {
   INFISICAL_CLIENT_SECRET: string;
   GOOGLE_CLIENT_ID: string;
   GOOGLE_CLIENT_SECRET: string;
+  AGENT_INFISICAL_CLIENT_ID?: string; // optional: limited identity used only by issue_temp_token
+  AGENT_INFISICAL_CLIENT_SECRET?: string;
+  AGENT_TOKEN_MAX_SECONDS?: string; // optional cap on token lifetime, default 3600
+  AGENT_REQUIRE_READ_ONLY?: string; // "true" = refuse to issue a token if the agent identity can change or delete secrets
 }
 
 const ok = (data: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] });
@@ -34,8 +40,13 @@ const INSTRUCTIONS = [
   "Use list_secrets to see which credentials exist (names, approved hosts; never values) and add_secret to store a new one. A secret can only be sent to the hosts in its own comment (a 'hosts: ...' line, shown as approved_hosts). When you store a token with add_secret you MUST pass hosts, the API's hostnames, e.g. [\"api.linear.app\"] or [\"*.atlassian.net\"] (no scheme or path); look up the service's API host if you are unsure. Hosts are fixed when the secret is created and cannot be changed through this server, so get them right the first time; only the owner can change them later. If api_request says a host is not allowed, tell the user.",
   "Secrets are organised in one folder per service (e.g. /notion/NOTION_TOKEN). api_request finds a secret by name in any folder; pass path only if the same name exists in several. When you add a token, put it in its own folder with path (e.g. /linear).",
   "Destructive actions always need the user's approval, enforced by the server: delete_secret, update_secret with a new value or name, and api_request for DELETE requests, GraphQL delete/archive-style mutations and bodies that set archived/trashed/deleted to true. The first call returns approval_required with a link; give the link to the user, wait until they say they approved it, then repeat the identical call with approval_id. An approval works once, for that exact action, for 15 minutes. Never try to work around it.",
+  "For real CLIs that need credentials in their environment (aws, terraform), use issue_temp_token. It ALWAYS needs the user's approval, with a \"give token\" checkbox they must tick: the first call returns approval_required + a link; after they approve, repeat the identical call to receive a short-lived Infisical token and commands (infisical run). Treat that token as a secret: never print it, write it to a file, commit it or send it anywhere. access_guide explains setup (agent identity, Agent Proxy, AWS CLI) and needs no approval.",
   "Never ask the user to paste a token into the chat if it can be stored with add_secret, and never try to read secret values back.",
 ].join("\n");
+
+const MAX_TOKEN_SECONDS_DEFAULT = 3600;
+const duration = (sec: number) =>
+  sec % 86400 === 0 ? `${sec / 86400} day${sec === 86400 ? "" : "s"}` : sec % 3600 === 0 ? `${sec / 3600} hour${sec === 3600 ? "" : "s"}` : sec >= 3600 ? `${(sec / 3600).toFixed(1)} hours` : `${Math.round(sec / 60)} minutes`;
 
 export function createServer(env: Env) {
   const server = new McpServer(
@@ -53,17 +64,18 @@ export function createServer(env: Env) {
       environment: a.environment ?? env.DEFAULT_ENVIRONMENT,
       secretPath: a.path ?? "/",
     });
-    // Destructive actions: first call returns a link for the human; the repeat call carries approval_id.
-    const gate = async (tool: string, args: Record<string, unknown>, summary: string[]) => {
+    // Risky actions: the first call returns a link for the human; the repeat call carries approval_id.
+    const gate = async (tool: string, args: Record<string, unknown>, spec: ApprovalSpec) => {
       const approvalId = typeof args.approval_id === "string" ? args.approval_id : undefined;
       if (approvalId) {
         const c = await checkApproval(env, approvalId, tool, args);
         return c.ok ? null : fail(new Error(c.reason));
       }
-      const r = await requestApproval(env, tool, args, summary);
+      const r = await requestApproval(env, tool, args, spec);
       return ok({
-        approval_required: true, approval_id: r.id, approve_url: r.url, expires_in_minutes: r.expiresInMinutes, action: summary,
-        next_step: `Tell the user to open approve_url, sign in with Google and press Approve. After they confirm, call ${tool} again with exactly the same arguments plus approval_id. Do not repeat the call before they confirm.`,
+        approval_required: true, approval_id: r.id, approve_url: r.url, expires_in_minutes: r.expiresInMinutes,
+        action: [spec.title, ...spec.rows.map(([k, v]) => `${k}: ${v}`)],
+        next_step: `Tell the user to open approve_url, sign in with Google if asked, review the details${spec.ack ? ", tick the confirmation box" : ""} and press ${spec.ack ? "Give token" : "Approve"}. After they confirm, call ${tool} again with exactly the same arguments plus approval_id. Do not repeat the call before they confirm.`,
       });
     };
     const approvalField = { approval_id: z.string().optional().describe("From an earlier approval_required response, after the user approved it") };
@@ -117,11 +129,14 @@ export function createServer(env: Env) {
           const why = destructiveReason(a.method, a.body);
           if (why) {
             const preview = typeof a.body === "string" ? a.body : a.body !== undefined ? JSON.stringify(a.body) : "";
-            const held = await gate("api_request", a, [
-              `${a.method} ${a.url}`, `Why approval is needed: ${why}`, `Credential: ${a.secret ?? "AWS keys"} (${a.auth_type})`,
-              ...(a.query ? [`Query: ${JSON.stringify(a.query)}`] : []),
-              ...(preview ? [`Body: ${preview.slice(0, 400)}${preview.length > 400 ? "..." : ""}`] : []),
-            ]);
+            const held = await gate("api_request", a, {
+              title: "Send a destructive request", risk: "danger",
+              rows: [
+                ["Request", `${a.method} ${a.url}`], ["Why flagged", why], ["Credential", `${a.secret ?? "AWS keys"} (${a.auth_type})`],
+                ...(a.query ? [["Query", JSON.stringify(a.query)] as [string, string]] : []),
+                ...(preview ? [["Body", `${preview.slice(0, 400)}${preview.length > 400 ? "..." : ""}`] as [string, string]] : []),
+              ],
+            });
             if (held) return held;
           }
           return ok(await callApi(env, a));
@@ -203,11 +218,14 @@ export function createServer(env: Env) {
           if (a.value === undefined && a.comment === undefined && a.new_name === undefined) throw new Error("Nothing to update");
           const b = base(a);
           if (a.value !== undefined || a.new_name !== undefined) {
-            const held = await gate("update_secret", a, [
-              `Update secret ${a.name}`, `Environment: ${b.environment}`, `Folder: ${b.secretPath}`,
-              ...(a.value !== undefined ? ["Overwrite its value (the old value cannot be recovered through this server)"] : []),
-              ...(a.new_name !== undefined ? [`Rename it to ${a.new_name}`] : []),
-            ]);
+            const held = await gate("update_secret", a, {
+              title: a.value !== undefined ? "Overwrite a secret" : "Rename a secret", risk: "danger",
+              rows: [
+                ["Secret", a.name], ["Environment", b.environment], ["Folder", b.secretPath],
+                ...(a.value !== undefined ? [["Change", "Replace the value. The old one cannot be recovered through this server."] as [string, string]] : []),
+                ...(a.new_name !== undefined ? [["Rename to", a.new_name] as [string, string]] : []),
+              ],
+            });
             if (held) return held;
           }
           // Always send the comment back: Infisical clears it when omitted, which would also drop the approved hosts.
@@ -227,12 +245,106 @@ export function createServer(env: Env) {
       async (a) => {
         try {
           const b = base(a);
-          const held = await gate("delete_secret", a, ["Permanently delete secret", `Name: ${a.name}`, `Environment: ${b.environment}`, `Folder: ${b.secretPath}`]);
+          const held = await gate("delete_secret", a, { title: "Delete a secret", risk: "danger", rows: [["Secret", a.name], ["Environment", b.environment], ["Folder", b.secretPath], ["Effect", "Permanent. It cannot be undone through this server."]] });
           if (held) return held;
           await infisical.deleteSecret(env, a.name, b);
           return ok({ deleted: a.name, environment: b.environment, path: b.secretPath });
         } catch (e) { return fail(e); }
       },
+    );
+
+    server.registerTool(
+      "issue_temp_token",
+      {
+        description:
+          "Get a short-lived Infisical access token so a CLI such as aws or terraform can read secrets (via `infisical run`). ALWAYS needs the user's approval with a 'give token' checkbox they must tick: the first call returns approval_required and a link; after they approve, repeat the identical call to receive the token and the commands to use it. " +
+          "The token belongs to a limited 'agent' identity configured by the owner (not this server's own identity) and expires on its own. Treat it as a secret: never print it, store it or send it anywhere. If the agent identity is not set up yet, this returns the setup steps instead. " +
+          "use: git_clone (clone private repos with the stored GITHUB_TOKEN), github_cli (gh), aws_cli, infisical_run (any other command), rest_api (call the Infisical API). The response has the exact `infisical run` command to run, with the secrets of `path` injected into that one command.",
+        inputSchema: z.object({
+          purpose: z.string().min(5).max(200).describe("Why you need the token, in a sentence. The user sees this."),
+          use: z.enum(["aws_cli", "git_clone", "github_cli", "infisical_run", "rest_api"]).default("aws_cli"),
+          environment: z.string().optional().describe("Environment you will read (default from config, e.g. dev)"),
+          path: z.string().optional().describe("Folder holding the secrets the command needs, e.g. /github or /aws. Default: /github for git_clone and github_cli, /aws for aws_cli, otherwise /."),
+          command: z.string().max(300).optional().describe("The command you plan to run (shown to the user and put into the returned commands). The approval is for the token, not for this command."),
+          ...approvalField,
+        }),
+      },
+      async (a) => {
+        try {
+          if (!agentConfigured(env)) {
+            return ok({
+              configured: false,
+              message: "No agent identity is set up, so no token can be issued. The owner needs to create one first; the steps are below.",
+              how_to_set_up: guide("agent_identity"),
+            });
+          }
+          const environment = a.environment ?? env.DEFAULT_ENVIRONMENT;
+          const path = a.path ?? ({ aws_cli: "/aws", git_clone: "/github", github_cli: "/github" } as Record<string, string>)[a.use] ?? "/";
+          // A token handed to an assistant must be short-lived. Its lifetime is set on the agent identity in Infisical, so log in
+          // once up front (the probe token is thrown away, never shown) to learn it, refuse if it is too long, and show it to the human.
+          const maxSeconds = Number(env.AGENT_TOKEN_MAX_SECONDS) > 0 ? Number(env.AGENT_TOKEN_MAX_SECONDS) : MAX_TOKEN_SECONDS_DEFAULT;
+          const tooLong = (sec: number) => ({
+            issued: false,
+            reason: `The agent identity issues tokens that live ${duration(sec)}, longer than the ${duration(maxSeconds)} allowed for a token handed to an assistant. No token was issued. The owner should set the identity's Access Token TTL and Max TTL in Infisical to ${duration(maxSeconds)} or less.`,
+          });
+          let lifetime = "Checked when you approve";
+          let access: AccessSummary | undefined;
+          if (typeof a.approval_id !== "string") {
+            const probe = await mintAgentToken(env);
+            if (!(probe.expiresIn > 0) || probe.expiresIn > maxSeconds) return ok(tooLong(probe.expiresIn));
+            lifetime = `${duration(probe.expiresIn)}, then it stops working`;
+            access = await probeAccess(env, probe.accessToken, env.INFISICAL_PROJECT_ID, environment); // measured now, shown to the approver
+            if (access.canWrite && env.AGENT_REQUIRE_READ_ONLY === "true") {
+              return ok({ issued: false, reason: "The agent identity can change or delete secrets, and this server is set to hand out read-only tokens only (AGENT_REQUIRE_READ_ONLY). No token was issued. The owner should give the identity a read-only role in Infisical." });
+            }
+          }
+          const useLabel = { aws_cli: "Running the AWS CLI", git_clone: "Cloning repositories with git", github_cli: "Running the GitHub CLI", infisical_run: "Running a command with `infisical run`", rest_api: "Calling the Infisical API" }[a.use];
+          const held = await gate("issue_temp_token", a, {
+            title: "Give the assistant a temporary Infisical token",
+            risk: "token",
+            rows: [
+              ["Purpose", a.purpose], ["Will be used for", useLabel], ...(a.command ? [["Command", a.command] as [string, string]] : []), ["Project", env.INFISICAL_PROJECT_ID], ["Environment", environment], ["Folder", path],
+              ["Identity", `agent identity (client id ending ${String(env.AGENT_INFISICAL_CLIENT_ID).slice(-6)})`],
+              ["Lifetime", lifetime],
+              ...(access
+                ? ([
+                    ["Can read", access.total === 0 ? "Nothing in this environment" : `${access.total} secret${access.total === 1 ? "" : "s"} in ${access.folders.length} folder${access.folders.length === 1 ? "" : "s"} of ${environment}: ${access.folders.map((f) => `${f.path} (${f.count})`).join(", ")}`],
+                    access.canWrite
+                      ? ["Can change or delete", "YES (tested). With this token the assistant could overwrite or delete these secrets without asking you again.", "warn"]
+                      : ["Can change or delete", access.canWrite === false ? "No (tested): read-only" : "Could not be tested"],
+                    ["Note", `The folder above only selects which secrets \`infisical run\` puts into the command. The token itself can use everything listed under "Can read".`],
+                  ] as ApprovalSpec["rows"])
+                : []),
+            ],
+            ack: "Yes, give the assistant a temporary Infisical token. I understand it can read whatever the agent identity is allowed to read until it expires.",
+          });
+          if (held) return held;
+          const t = await mintAgentToken(env);
+          if (!(t.expiresIn > 0) || t.expiresIn > maxSeconds) return ok(tooLong(t.expiresIn)); // the identity changed since the preview; hand nothing out
+          return ok({
+            token: t.accessToken,
+            expires_in_human: duration(t.expiresIn),
+            token_type: t.tokenType,
+            expires_in_seconds: t.expiresIn,
+            expires_at: new Date(Date.now() + t.expiresIn * 1000).toISOString(),
+            infisical_host: env.INFISICAL_HOST,
+            project_id: env.INFISICAL_PROJECT_ID,
+            environment,
+            path,
+            how_to_use: usage({ use: a.use as Use, host: env.INFISICAL_HOST, projectId: env.INFISICAL_PROJECT_ID, environment, path, command: a.command }),
+            reminder: "This is a secret. Do not print it, write it to a file, commit it or send it anywhere. It stops working when it expires.",
+          });
+        } catch (e) { return fail(e); }
+      },
+    );
+
+    server.registerTool(
+      "access_guide",
+      {
+        description: "Explains how to set up and use temporary access for CLIs: the limited agent identity, running the Infisical Agent Proxy server, and running the AWS CLI. Returns text only (no secrets); needs no approval.",
+        inputSchema: z.object({ topic: z.enum(["overview", "agent_identity", "proxy", "aws", "all"]).default("overview") }),
+      },
+      async (a) => ({ content: [{ type: "text" as const, text: a.topic === "all" ? fullGuide() : guide(a.topic as Topic) }] }),
     );
   }
   return server;

@@ -16,6 +16,7 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 - `src/approval-store.ts` / `src/store-core.ts`: the Durable Object and its Node-testable logic (expiry, sweep).
 - `src/destructive.ts`: best-effort detection of destructive api_request calls beyond HTTP DELETE.
 - `src/approvals.ts`: approval records (Durable Object `ApprovalStore`, strongly consistent; KV only as a test fallback), the `/approve/*` pages, and the approval Google sign-in via `/callback` (state `ap.*`).
+- `src/temp-token.ts` / `src/guide.ts`: agent-identity token minting; guide text (also generates `docs/agent-access.md`).
 - `src/hosts.ts`: validation and parsing of the `hosts:` comment line.
 - `src/infisical.ts`: thin Infisical REST client (Universal Auth). `getSecretValue` is server-side only.
 - `src/google-handler.ts`: Google sign-in, consent page, `/callback`. Bad OAuth params return 400, not a crash.
@@ -24,6 +25,8 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 ## Tools
 - **`api_request`** (main): authenticated HTTPS call. `auth_type`: bearer (default), header, basic, query,
   aws_sigv4. Uploads: `multipart` or `body_base64` (5 MB cap). Redirects are not followed.
+- `issue_temp_token`: short-lived Infisical token (limited agent identity) for CLIs like aws; ALWAYS needs approval with a
+  must-tick "give token" box; refuses lifetimes over 1 h; shows the identity's measured access (read scope, can it write?). `access_guide`: setup text only. See `docs/agent-access.md`.
 - Supporting: `list_environments`, `list_folders`, `list_secrets`, `get_secret`, `add_secret`, `update_secret`,
   `delete_secret` (needs `confirm: true`). These never return secret values.
 
@@ -31,6 +34,8 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 delete/archive-style mutations, bodies setting archived/trashed/deleted true; see `src/destructive.ts`) need a human: the
 first call returns `approval_required` + a link (`src/approvals.ts`); the user signs in with Google once (12 h session cookie), then each link is one click; the repeat
 call with `approval_id` runs once, only for the exact same arguments, within 15 minutes. Never bypass or weaken this.
+
+The approval page (`src/approvals.ts`) is script-free; a request can carry an `ack` checkbox that the server enforces.
 
 **Folders:** secrets live in one Infisical folder per service (`/notion`, `/github`, `/linear`, `/tavily`, `/firecrawl`).
 `api_request` finds a secret by name in any folder (error if the name exists in several; pass `path`).

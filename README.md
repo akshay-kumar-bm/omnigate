@@ -4,7 +4,7 @@ Universal API MCP server. (The Cloudflare Worker is still named `infisical-mcp`,
 
 One MCP server that lets Claude call **any HTTPS API or integration** (GitHub, Jira, Notion, Stripe, Slack, AWS, ...) with credentials kept in Infisical, so the model never sees a token. Runs on Cloudflare Workers (free plan) behind Google sign-in.
 
-Main tool: **`api_request`**. Supporting tools for the credentials it uses: `list_environments`, `list_folders`, `list_secrets`, `get_secret`, `add_secret`, `update_secret`, `delete_secret` (needs `confirm: true`).
+Main tool: **`api_request`**. Also `issue_temp_token` and `access_guide` (below). Supporting tools for the credentials it uses: `list_environments`, `list_folders`, `list_secrets`, `get_secret`, `add_secret`, `update_secret`, `delete_secret` (needs `confirm: true`).
 
 **Values never come back to the client.** List/get use `viewSecretValue=false` and responses are redacted. `add_secret`/`update_secret` do pass the new value through the MCP client once.
 
@@ -50,6 +50,9 @@ Everything else (reads, creates, other writes, comment-only edits) runs automati
 Approval records, sign-in sessions and one-time nonces live in a **Durable Object** (`ApprovalStore`), not Workers KV: KV is only eventually consistent, so an approval made in one region could still read as "pending" in another for up to a minute. A Durable Object reads its own writes everywhere, so a retry right after you click Approve sees it.
 
 Limits: detection of non-`DELETE` destructive API calls is best effort (`src/destructive.ts`). It reads GraphQL field names (aliases can't hide them; string literals and comments are ignored) and archive-style flags, but a destructive operation that uses other wording or a persisted query id is not recognised. Method-override headers are refused so they can't disguise a `DELETE`.
+
+## Temporary tokens for CLIs (`issue_temp_token`)
+For tools that need credentials in their own environment (the AWS CLI, terraform), `issue_temp_token` gives the assistant a short-lived Infisical token to use with `infisical run -- <command>`. **Every request needs a person**: the approval page shows the purpose, project, folder and the token's lifetime, and the approver must tick a "give token" box (enforced on the server). The token comes from a separate limited "agent" identity (Worker secrets `AGENT_INFISICAL_CLIENT_ID` / `AGENT_INFISICAL_CLIENT_SECRET`), never the server's own, and the server refuses to hand out one that lives longer than 1 hour. Not set up yet? The tool says so and returns the steps. Full guide (agent identity, AWS CLI, running the Agent Proxy server): [docs/agent-access.md](docs/agent-access.md), also available from the `access_guide` tool.
 
 ## Deploy
 Pushes to `main` deploy automatically via GitHub Actions (`.github/workflows/deploy.yml`; repo secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`). The steps below are the one-time setup and the manual route.
