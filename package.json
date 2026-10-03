@@ -14,6 +14,7 @@
     "@modelcontextprotocol/client": "^2.0.0",
     "@modelcontextprotocol/server": "2.0.0",
     "agents": "0.26.0",
+    "aws4fetch": "1.0.20",
     "zod": "^4.0.0"
   },
   "devDependencies": {
