@@ -4,7 +4,7 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-09-01",
   "compatibility_flags": ["nodejs_compat"],
-  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "REPLACE_WITH_KV_ID" }],
+  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "24e5e7bc79544f20a3608707b592e1f3" }],
   "vars": {
     "INFISICAL_HOST": "https://us.infisical.com",
     "INFISICAL_PROJECT_ID": "e550c9ba-7757-4c6f-a3c2-ca83e8ec20b3",
