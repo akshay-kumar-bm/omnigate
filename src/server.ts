@@ -94,7 +94,7 @@ export function createServer(env: Env) {
           "Pass the secret NAME (see list_secrets); the server reads the token, adds the auth, calls the API and returns the response with the token redacted. " +
           "A secret can only be sent to the hosts in its own comment (the hosts given to add_secret; see approved_hosts in list_secrets), otherwise the call is refused and the error lists the approved hosts. Redirects are not followed. " +
           "auth_type: bearer (default; Authorization: Bearer <secret>), header (header_name + optional header_prefix), basic (secret = 'user:pass', or username + secret as password), query (query_param), " +
-          "file uploads: body_base64 (raw bytes) or multipart (form with files), up to 5 MB; aws_sigv4 (signs with secrets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / optional AWS_SESSION_TOKEN; needs aws_service and aws_region). Do not send your own Authorization header. Destructive requests always need the user's approval: method DELETE, GraphQL mutations whose names contain delete/destroy/remove/archive/purge/trash, and bodies that set archived/trashed/deleted to true. The first call returns an approval link, and you repeat the call with approval_id once they approve.",
+          "file uploads: body_base64 (raw bytes) or multipart (form with files), up to 5 MB, or for bigger files first call get_upload_url, upload with curl, then pass the download URL as body_source or as a multipart file's source (up to 25 MB; the server reads it, nothing passes through the chat); aws_sigv4 (signs with secrets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / optional AWS_SESSION_TOKEN; needs aws_service and aws_region). Do not send your own Authorization header. Destructive requests always need the user's approval: method DELETE, GraphQL mutations whose names contain delete/destroy/remove/archive/purge/trash, and bodies that set archived/trashed/deleted to true. The first call returns an approval link, and you repeat the call with approval_id once they approve.",
         inputSchema: z.object({
           url: z.string().url().describe("Full https:// URL"),
           method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]).default("GET"),
@@ -102,15 +102,17 @@ export function createServer(env: Env) {
           query: z.record(z.string(), z.string()).optional().describe("Query string params"),
           body: z.union([z.string(), z.record(z.string(), z.unknown()), z.array(z.unknown())]).optional().describe("Request body; objects/arrays are sent as JSON"),
           body_base64: z.string().optional().describe("Raw binary request body as base64 (max 5 MB decoded), e.g. PUT an object to S3. Set Content-Type in headers. Use instead of body."),
+          body_source: z.string().optional().describe("Send a file stored with get_upload_url as the raw request body: pass its download URL (or key). The server reads it and forwards it, so the bytes never pass through the chat (max 25 MB). Use instead of body_base64."),
           multipart: z.object({
             fields: z.record(z.string(), z.string()).optional().describe("Plain form fields, sent before the files"),
             files: z.array(z.object({
               field: z.string().default("file").describe("Form field name, default 'file'"),
-              filename: z.string(),
-              content_type: z.string().optional().describe("e.g. image/png"),
-              data_base64: z.string().describe("File bytes as base64"),
+              filename: z.string().optional().describe("File name; required with data_base64, defaults to the stored name with source"),
+              content_type: z.string().optional().describe("e.g. image/png; defaults to the stored file's type with source"),
+              data_base64: z.string().optional().describe("File bytes as base64 (max 5 MB). Use this OR source."),
+              source: z.string().optional().describe("Download URL (or key) of a file stored with get_upload_url; the server reads it itself (max 25 MB total). Use this OR data_base64."),
             })).min(1),
-          }).optional().describe("multipart/form-data upload (max 5 MB total decoded), e.g. Notion /v1/file_uploads/{id}/send. Use instead of body. Not for aws_sigv4."),
+          }).optional().describe("multipart/form-data upload (max 5 MB total with data_base64, 25 MB with source), e.g. Notion /v1/file_uploads/{id}/send. Use instead of body. Not for aws_sigv4."),
           auth_type: z.enum(["bearer", "header", "basic", "query", "aws_sigv4"]).default("bearer"),
           secret: secretName.optional().describe("Name of the secret holding the token / API key (not needed for aws_sigv4)"),
           header_name: z.string().optional(),

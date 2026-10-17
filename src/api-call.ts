@@ -6,8 +6,9 @@
 import { AwsClient } from "aws4fetch";
 import { commentHosts } from "./hosts";
 import { infisical } from "./infisical";
+import { fetchStored, MAX_STORED_BYTES, type UploadEnv } from "./uploads";
 
-export interface ApiCallEnv {
+export interface ApiCallEnv extends UploadEnv {
   INFISICAL_HOST: string;
   INFISICAL_CLIENT_ID: string;
   INFISICAL_CLIENT_SECRET: string;
@@ -22,7 +23,8 @@ export interface ApiCallArgs {
   query?: Record<string, string>;
   body?: unknown;
   body_base64?: string; // raw binary request body (e.g. PUT an object to S3)
-  multipart?: { fields?: Record<string, string>; files: { field?: string; filename: string; content_type?: string; data_base64: string }[] };
+  body_source?: string; // a file stored by get_upload_url (its download URL or key): the Worker reads it and sends it as the raw body
+  multipart?: { fields?: Record<string, string>; files: { field?: string; filename?: string; content_type?: string; data_base64?: string; source?: string }[] };
   auth_type?: "bearer" | "header" | "basic" | "query" | "aws_sigv4";
   secret?: string;
   header_name?: string;
@@ -107,8 +109,8 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
     if (headers.has(h)) throw new Error(`The ${h} header is not allowed`);
   }
 
-  const given = [a.body !== undefined && a.body !== null, !!a.body_base64, !!a.multipart].filter(Boolean).length;
-  if (given > 1) throw new Error("Send only one of body, body_base64, multipart");
+  const given = [a.body !== undefined && a.body !== null, !!a.body_base64, !!a.body_source, !!a.multipart].filter(Boolean).length;
+  if (given > 1) throw new Error("Send only one of body, body_base64, body_source, multipart");
   let body: string | Uint8Array | FormData | undefined;
   let uploadBytes = 0;
   if (a.body !== undefined && a.body !== null) {
@@ -120,15 +122,29 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
   } else if (a.body_base64) {
     body = decodeBase64(a.body_base64);
     uploadBytes = body.length;
+  } else if (a.body_source) {
+    const f = await fetchStored(env, a.body_source);
+    body = f.bytes;
+    uploadBytes = f.bytes.length;
+    if (!headers.has("content-type")) headers.set("content-type", f.contentType);
   } else if (a.multipart) {
     if (a.auth_type === "aws_sigv4") throw new Error("multipart is not supported with aws_sigv4; use body_base64");
     const fd = new FormData();
     for (const [k, v] of Object.entries(a.multipart.fields ?? {})) fd.append(k, v);
     for (const f of a.multipart.files) {
-      const bytes = decodeBase64(f.data_base64);
+      if (!!f.data_base64 === !!f.source) throw new Error("Each file needs exactly one of data_base64 or source");
+      let bytes: Uint8Array, type = f.content_type, name = f.filename;
+      if (f.source) {
+        const st = await fetchStored(env, f.source);
+        bytes = st.bytes; type ??= st.contentType; name ??= st.name;
+      } else {
+        bytes = decodeBase64(f.data_base64!);
+      }
+      if (!name) throw new Error("filename is required with data_base64");
       uploadBytes += bytes.length;
-      if (uploadBytes > MAX_UPLOAD) throw new Error(`Upload too large (max ${MAX_UPLOAD / 1024 / 1024} MB in total)`);
-      fd.append(f.field ?? "file", new Blob([bytes], { type: f.content_type ?? "application/octet-stream" }), f.filename);
+      const cap = a.multipart.files.some((x) => x.source) ? MAX_STORED_BYTES : MAX_UPLOAD;
+      if (uploadBytes > cap) throw new Error(`Upload too large (max ${cap / 1024 / 1024} MB in total)`);
+      fd.append(f.field ?? "file", new Blob([bytes], { type: type ?? "application/octet-stream" }), name);
     }
     headers.delete("content-type"); // fetch sets multipart/form-data with the boundary
     body = fd;

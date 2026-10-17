@@ -111,3 +111,34 @@ export async function createUpload(e: UploadEnv, a: { filename?: string; content
     auto_delete: autoDelete,
   };
 }
+
+// Read a file that get_upload_url stored, so api_request can send it to another API without the bytes passing through the chat.
+// Only objects this feature created are readable: the reference must be a key (or the download URL) under tmp/<uuid>/<name> in our
+// own bucket. Any other URL is refused, so this cannot be used to make the Worker fetch arbitrary addresses. The Worker signs its own
+// request, so the link's expiry does not matter.
+export const MAX_STORED_BYTES = 25 * 1024 * 1024; // the bytes are held in memory (and copied into a form), so keep this well under the Worker's 128 MB
+const KEY_RE = /^tmp\/[0-9a-f-]{36}\/[A-Za-z0-9._-]{1,120}$/;
+
+export function storedKey(e: UploadEnv, ref: string): string {
+  let key = ref.trim();
+  if (/^https?:\/\//i.test(key)) {
+    const u = new URL(key);
+    if (u.protocol !== "https:" || u.host !== `${e.R2_BUCKET}.${e.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`) throw new Error("source must be the download URL (or key) returned by get_upload_url");
+    key = decodeURIComponent(u.pathname.slice(1));
+  }
+  if (!KEY_RE.test(key)) throw new Error("source must be the download URL (or key) returned by get_upload_url");
+  return key;
+}
+
+export async function fetchStored(e: UploadEnv, ref: string): Promise<{ bytes: Uint8Array; contentType: string; name: string }> {
+  if (!uploadsConfigured(e)) throw new Error("File storage is not set up on this server, so source cannot be used");
+  const key = storedKey(e, ref);
+  const r = await client(e).fetch(objectUrl(e, key), { signal: AbortSignal.timeout(25_000) });
+  if (r.status === 404) throw new Error("The stored file was not found. It may not have been uploaded yet (run the curl first), or it was deleted after a day");
+  if (!r.ok) throw new Error(`Could not read the stored file (status ${r.status})`);
+  const declared = Number(r.headers.get("content-length") ?? 0);
+  if (declared > MAX_STORED_BYTES) throw new Error(`Stored file is too large to forward (max ${MAX_STORED_BYTES / 1024 / 1024} MB)`);
+  const bytes = new Uint8Array(await r.arrayBuffer());
+  if (bytes.length > MAX_STORED_BYTES) throw new Error(`Stored file is too large to forward (max ${MAX_STORED_BYTES / 1024 / 1024} MB)`);
+  return { bytes, contentType: r.headers.get("content-type") ?? "application/octet-stream", name: key.split("/").pop()! };
+}
