@@ -7,8 +7,9 @@ import { agentConfigured, mintAgentToken, probeAccess, type AccessSummary } from
 import { fullGuide, guide, usage, type Topic } from "./guide";
 import { destructiveReason } from "./destructive";
 import { buildComment, commentHosts } from "./hosts";
+import { createUpload, SETUP as UPLOAD_SETUP, uploadsConfigured, type UploadEnv } from "./uploads";
 
-export interface Env {
+export interface Env extends UploadEnv {
   OAUTH_KV: KVNamespace;
   APPROVAL_STORE?: DurableObjectNamespace<import("./approval-store").ApprovalStore>; // absent only in local tests
   OAUTH_PROVIDER: any;
@@ -42,6 +43,7 @@ const INSTRUCTIONS = [
   "Secrets are organised in one folder per service (e.g. /notion/NOTION_TOKEN). api_request finds a secret by name in any folder; pass path only if the same name exists in several. When you add a token, put it in its own folder with path (e.g. /linear).",
   "Destructive actions always need the user's approval, enforced by the server: delete_secret, update_secret with a new value or name, and api_request for DELETE requests, GraphQL delete/archive-style mutations and bodies that set archived/trashed/deleted to true. The first call returns approval_required with a link; give the link to the user, wait until they say they approved it, then repeat the identical call with approval_id. An approval works once, for that exact action, for 15 minutes. Never try to work around it.",
   "For real CLIs that need credentials in their environment (aws, terraform), use issue_temp_token. It ALWAYS needs the user's approval, with a \"give token\" checkbox they must tick: the first call returns approval_required + a link; after they approve, repeat the identical call to receive a short-lived Infisical token and commands (infisical run). Treat that token as a secret: never print it, write it to a file, commit it or send it anywhere. access_guide explains setup (agent identity, Agent Proxy, AWS CLI) and needs no approval.",
+  "For files too big to pass through the chat (or any file on disk), use get_upload_url: it needs no approval and returns a one-time upload URL (run the given curl with the file path) and a temporary download URL you can hand to other API calls.",
   "Never ask the user to paste a token into the chat if it can be stored with add_secret, and never try to read secret values back.",
 ].join("\n");
 
@@ -330,6 +332,22 @@ export function createServer(env: Env) {
             how_to_use: usage({ host: env.INFISICAL_HOST, projectId, environment }),
             reminder: "Secret. Set it once as the global INFISICAL_TOKEN (see how_to_use) and reuse it until it expires; do not print it, and do not request a new one per command.",
           });
+        } catch (e) { return fail(e); }
+      },
+    );
+
+    server.registerTool(
+      "get_upload_url",
+      {
+        description:
+          "Upload a file of any size (up to 5 GB) from the machine you run on to temporary storage, without the file passing through the chat, and get a download URL for other API calls (e.g. a file URL to hand to Notion, GitHub, an email API). " +
+          "Returns a one-time upload URL (run the given curl PUT with the file path) and a download URL that expires on its own; uploaded files are deleted automatically after a day. No approval needed. Do not upload anything the user would not want copied to a temporary link.",
+        inputSchema: z.object({ filename: z.string().max(200).optional().describe("Name for the file, e.g. report.pdf. Used for the download name.") }),
+      },
+      async (a) => {
+        try {
+          if (!uploadsConfigured(env)) return ok({ configured: false, message: "File upload storage is not set up yet, so no upload URL can be issued. The owner needs to set it up once.", how_to_set_up: UPLOAD_SETUP });
+          return ok(await createUpload(env, a));
         } catch (e) { return fail(e); }
       },
     );
