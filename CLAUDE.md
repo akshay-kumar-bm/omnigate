@@ -17,6 +17,7 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 - `src/destructive.ts`: best-effort detection of destructive api_request calls beyond HTTP DELETE.
 - `src/approvals.ts`: approval records (Durable Object `ApprovalStore`, strongly consistent; KV only as a test fallback), the `/approve/*` pages, and the approval Google sign-in via `/callback` (state `ap.*`).
 - `src/temp-token.ts` / `src/guide.ts`: agent-identity token minting; guide text (also generates `docs/agent-access.md`).
+- `src/uploads.ts`: `get_upload_url` (R2 presigned URLs; setup text lives here).
 - `src/hosts.ts`: validation and parsing of the `hosts:` comment line.
 - `src/infisical.ts`: thin Infisical REST client (Universal Auth). `getSecretValue` is server-side only.
 - `src/google-handler.ts`: Google sign-in, consent page, `/callback`. Bad OAuth params return 400, not a crash.
@@ -27,6 +28,7 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
   aws_sigv4. Uploads: `multipart` or `body_base64` (5 MB cap). Redirects are not followed.
 - `issue_temp_token`: short-lived Infisical token (limited agent identity) for CLIs like aws; ALWAYS needs approval with a
   must-tick "give token" box; refuses lifetimes over 1 h; shows the identity's measured access (read scope, can it write?). The agent identity belongs only to a separate small project (`AGENT_PROJECT_ID`, "cli-secrets"), not the main one: Infisical's plan has no per-folder roles, so a separate project is the only way to limit what a token can read. `access_guide`: setup text only. See `docs/agent-access.md`.
+- `get_upload_url`: NO approval by design. Returns a presigned R2 PUT (5 min, signs `If-None-Match: *` so only the first write to the random key succeeds) for the assistant to `curl -T <file>`, plus a presigned GET (1 h) to hand to other APIs. Objects live under `tmp/` and a bucket lifecycle rule deletes them after 1 day (the shortest R2 allows); the tool reports whether that rule exists. Needs `R2_ACCOUNT_ID`, `R2_BUCKET` (vars) and `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` (Worker secrets); until set it returns the setup steps.
 - Supporting: `list_environments`, `list_folders`, `list_secrets`, `get_secret`, `add_secret`, `update_secret`,
   `delete_secret` (needs `confirm: true`). These never return secret values.
 
