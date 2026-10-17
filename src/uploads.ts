@@ -20,6 +20,19 @@ const PUT_DEFAULT = 300;
 const GET_DEFAULT = 3600;
 const GET_MAX = 86_400;
 
+// Notion and other APIs check the file type, and R2 serves back whatever Content-Type the upload sent. The Content-Type header is
+// not signed (the signing library skips it), so this is a convenience for the curl command, not a security control.
+const MIME: Record<string, string> = {
+  pdf: "application/pdf", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
+  txt: "text/plain", md: "text/markdown", csv: "text/csv", json: "application/json", html: "text/html", zip: "application/zip",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation", mp3: "audio/mpeg", mp4: "video/mp4", mov: "video/quicktime",
+};
+export function contentTypeFor(filename: string, given?: string): string {
+  if (given && /^[A-Za-z0-9.+-]+\/[A-Za-z0-9.+-]+$/.test(given)) return given;
+  return MIME[filename.split(".").pop()?.toLowerCase() ?? ""] ?? "application/octet-stream";
+}
+
 export const uploadsConfigured = (e: UploadEnv) => !!(e.R2_ACCOUNT_ID && e.R2_BUCKET && e.R2_ACCESS_KEY_ID && e.R2_SECRET_ACCESS_KEY);
 
 export const SETUP = `One-time setup for get_upload_url (Cloudflare R2):
@@ -76,22 +89,24 @@ export async function autoDeleteStatus(e: UploadEnv): Promise<string> {
   return value;
 }
 
-export async function createUpload(e: UploadEnv, a: { filename?: string }) {
+export async function createUpload(e: UploadEnv, a: { filename?: string; content_type?: string }) {
   const putSeconds = seconds(e.UPLOAD_PUT_SECONDS, PUT_DEFAULT, 3600);
   const getSeconds = seconds(e.UPLOAD_GET_SECONDS, GET_DEFAULT, GET_MAX);
   const key = `${UPLOAD_PREFIX}${crypto.randomUUID()}/${safeName(a.filename)}`;
   const putHeaders = { "if-none-match": "*" };
+  const contentType = contentTypeFor(safeName(a.filename), a.content_type);
   const [putUrl, getUrl, autoDelete] = await Promise.all([presign(e, "PUT", key, putSeconds, putHeaders), presign(e, "GET", key, getSeconds), autoDeleteStatus(e)]);
   return {
     upload: {
       method: "PUT",
       url: putUrl,
-      required_header: "If-None-Match: *",
+      required_headers: ["If-None-Match: *", `Content-Type: ${contentType}`],
       expires_in_seconds: putSeconds,
       single_use: "R2 accepts only the first write to this key.",
-      curl: `curl --fail -sS -X PUT -H 'If-None-Match: *' -T '<path to the file>' '${putUrl}'`,
+      curl: `curl --fail -sS -X PUT -H 'If-None-Match: *' -H 'Content-Type: ${contentType}' -T '<path to the file>' '${putUrl}'`,
     },
     download: { url: getUrl, expires_in_seconds: getSeconds, note: "Pass this as the file URL to other API calls. Anyone with the link can read the file until it expires." },
+    content_type: contentType,
     key,
     auto_delete: autoDelete,
   };

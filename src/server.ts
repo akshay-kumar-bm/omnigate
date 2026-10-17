@@ -342,7 +342,10 @@ export function createServer(env: Env) {
         description:
           "Upload a file of any size (up to 5 GB) from the machine you run on to temporary storage, without the file passing through the chat, and get a download URL for other API calls (e.g. a file URL to hand to Notion, GitHub, an email API). " +
           "Returns a one-time upload URL (run the given curl PUT with the file path) and a download URL that expires on its own; uploaded files are deleted automatically after a day. No approval needed. Do not upload anything the user would not want copied to a temporary link.",
-        inputSchema: z.object({ filename: z.string().max(200).optional().describe("Name for the file, e.g. report.pdf. Used for the download name.") }),
+        inputSchema: z.object({
+          filename: z.string().max(200).optional().describe("Name for the file, e.g. report.pdf. Used for the download name and to pick the file type."),
+          content_type: z.string().max(100).optional().describe("File type, e.g. application/pdf. Optional: guessed from the file name."),
+        }),
       },
       async (a) => {
         try {
