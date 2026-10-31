@@ -43,7 +43,7 @@ const INSTRUCTIONS = [
   "Secrets are organised in one folder per service (e.g. /notion/NOTION_TOKEN). api_request finds a secret by name in any folder; pass path only if the same name exists in several. When you add a token, put it in its own folder with path (e.g. /linear).",
   "Destructive actions always need the user's approval, enforced by the server: delete_secret, update_secret with a new value or name, and api_request for DELETE requests, GraphQL delete/archive-style mutations and bodies that set archived/trashed/deleted to true. The first call returns approval_required with a link; give the link to the user, wait until they say they approved it, then repeat the identical call with approval_id. An approval works once, for that exact action, for 15 minutes. Never try to work around it.",
   "For real CLIs that need credentials in their environment (aws, terraform), use issue_temp_token. It ALWAYS needs the user's approval, with a \"give token\" checkbox they must tick: the first call returns approval_required + a link; after they approve, repeat the identical call to receive a short-lived Infisical token and commands (infisical run). Treat that token as a secret: never print it, write it to a file, commit it or send it anywhere. access_guide explains setup (agent identity, Agent Proxy, AWS CLI) and needs no approval.",
-  "For files too big to pass through the chat (or any file on disk), use get_upload_url: it needs no approval and returns a one-time upload URL (run the given curl with the file path) and a temporary download URL you can hand to other API calls.",
+  "For files too big to pass through the chat (or any file on disk), use get_upload_url: it needs no approval and returns a one-time upload URL (run the given curl with the file path) and a temporary download URL you can hand to other API calls. For the reverse (an API returns audio, an image or a file), call api_request with save_response=true to get a download URL instead of the bytes.",
   "Never ask the user to paste a token into the chat if it can be stored with add_secret, and never try to read secret values back.",
 ].join("\n");
 
@@ -94,7 +94,9 @@ export function createServer(env: Env) {
           "Pass the secret NAME (see list_secrets); the server reads the token, adds the auth, calls the API and returns the response with the token redacted. " +
           "A secret can only be sent to the hosts in its own comment (the hosts given to add_secret; see approved_hosts in list_secrets), otherwise the call is refused and the error lists the approved hosts. Redirects are not followed. " +
           "auth_type: bearer (default; Authorization: Bearer <secret>), header (header_name + optional header_prefix), basic (secret = 'user:pass', or username + secret as password), query (query_param), " +
-          "file uploads: body_base64 (raw bytes) or multipart (form with files), up to 5 MB; aws_sigv4 (signs with secrets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / optional AWS_SESSION_TOKEN; needs aws_service and aws_region). Do not send your own Authorization header. Destructive requests always need the user's approval: method DELETE, GraphQL mutations whose names contain delete/destroy/remove/archive/purge/trash, and bodies that set archived/trashed/deleted to true. The first call returns an approval link, and you repeat the call with approval_id once they approve.",
+          "file uploads: body_base64 (raw bytes) or multipart (form with files), up to 5 MB, or for bigger files first call get_upload_url, upload with curl, then pass the download URL as body_source or as a multipart file's source (up to 25 MB; the server reads it, nothing passes through the chat); " +
+          "binary or large responses (generated audio, images, PDFs, exports): set save_response=true and the server stores a successful response in temporary storage and returns a download URL instead of the body (up to 25 MB, link valid 1 h, deleted after a day); " +
+          "aws_sigv4 (signs with secrets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / optional AWS_SESSION_TOKEN; needs aws_service and aws_region). Do not send your own Authorization header. Destructive requests always need the user's approval: method DELETE, GraphQL mutations whose names contain delete/destroy/remove/archive/purge/trash, and bodies that set archived/trashed/deleted to true. The first call returns an approval link, and you repeat the call with approval_id once they approve.",
         inputSchema: z.object({
           url: z.string().url().describe("Full https:// URL"),
           method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]).default("GET"),
@@ -102,15 +104,17 @@ export function createServer(env: Env) {
           query: z.record(z.string(), z.string()).optional().describe("Query string params"),
           body: z.union([z.string(), z.record(z.string(), z.unknown()), z.array(z.unknown())]).optional().describe("Request body; objects/arrays are sent as JSON"),
           body_base64: z.string().optional().describe("Raw binary request body as base64 (max 5 MB decoded), e.g. PUT an object to S3. Set Content-Type in headers. Use instead of body."),
+          body_source: z.string().optional().describe("Send a file stored with get_upload_url as the raw request body: pass its download URL (or key). The server reads it and forwards it, so the bytes never pass through the chat (max 25 MB). Use instead of body_base64."),
           multipart: z.object({
             fields: z.record(z.string(), z.string()).optional().describe("Plain form fields, sent before the files"),
             files: z.array(z.object({
               field: z.string().default("file").describe("Form field name, default 'file'"),
-              filename: z.string(),
-              content_type: z.string().optional().describe("e.g. image/png"),
-              data_base64: z.string().describe("File bytes as base64"),
+              filename: z.string().optional().describe("File name; required with data_base64, defaults to the stored name with source"),
+              content_type: z.string().optional().describe("e.g. image/png; defaults to the stored file's type with source"),
+              data_base64: z.string().optional().describe("File bytes as base64 (max 5 MB). Use this OR source."),
+              source: z.string().optional().describe("Download URL (or key) of a file stored with get_upload_url; the server reads it itself (max 25 MB total). Use this OR data_base64."),
             })).min(1),
-          }).optional().describe("multipart/form-data upload (max 5 MB total decoded), e.g. Notion /v1/file_uploads/{id}/send. Use instead of body. Not for aws_sigv4."),
+          }).optional().describe("multipart/form-data upload (max 5 MB total with data_base64, 25 MB with source), e.g. Notion /v1/file_uploads/{id}/send. Use instead of body. Not for aws_sigv4."),
           auth_type: z.enum(["bearer", "header", "basic", "query", "aws_sigv4"]).default("bearer"),
           secret: secretName.optional().describe("Name of the secret holding the token / API key (not needed for aws_sigv4)"),
           header_name: z.string().optional(),
@@ -122,6 +126,7 @@ export function createServer(env: Env) {
           aws_access_key_secret: secretName.optional().describe("default AWS_ACCESS_KEY_ID"),
           aws_secret_key_secret: secretName.optional().describe("default AWS_SECRET_ACCESS_KEY"),
           aws_session_token_secret: secretName.optional().describe("default AWS_SESSION_TOKEN"),
+          save_response: z.boolean().optional().describe("Store a successful (2xx) response body in temporary storage and return saved.download_url instead of the body. Use for binary output such as text-to-speech audio, images or file downloads. Error responses are returned as text as usual."),
           ...loc,
           ...approvalField,
           path: z.string().optional().describe("Folder of the secret, e.g. /notion. If omitted, the secret is found by name in any folder (an error if the name exists in several)."),
@@ -342,7 +347,10 @@ export function createServer(env: Env) {
         description:
           "Upload a file of any size (up to 5 GB) from the machine you run on to temporary storage, without the file passing through the chat, and get a download URL for other API calls (e.g. a file URL to hand to Notion, GitHub, an email API). " +
           "Returns a one-time upload URL (run the given curl PUT with the file path) and a download URL that expires on its own; uploaded files are deleted automatically after a day. No approval needed. Do not upload anything the user would not want copied to a temporary link.",
-        inputSchema: z.object({ filename: z.string().max(200).optional().describe("Name for the file, e.g. report.pdf. Used for the download name.") }),
+        inputSchema: z.object({
+          filename: z.string().max(200).optional().describe("Name for the file, e.g. report.pdf. Used for the download name and to pick the file type."),
+          content_type: z.string().max(100).optional().describe("File type, e.g. application/pdf. Optional: guessed from the file name."),
+        }),
       },
       async (a) => {
         try {

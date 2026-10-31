@@ -25,10 +25,12 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 
 ## Tools
 - **`api_request`** (main): authenticated HTTPS call. `auth_type`: bearer (default), header, basic, query,
-  aws_sigv4. Uploads: `multipart` or `body_base64` (5 MB cap). Redirects are not followed.
+  aws_sigv4. Uploads: `multipart` or `body_base64` (5 MB cap), or `body_source` / a multipart file's `source` = the download URL (or key) from `get_upload_url`: the Worker reads the stored file from R2 itself and forwards it (25 MB cap, held in memory); only keys under `tmp/<uuid>/` in our bucket are readable, never other URLs (`fetchStored` in `src/uploads.ts`). Redirects are not followed.
+  Downloads: `save_response: true` stores a 2xx body in R2 (`saveStored`, same `tmp/<uuid>/` keys) and returns a presigned
+  download URL instead of the body (25 MB cap; refused if the bytes contain the secret; storage checked before the call).
 - `issue_temp_token`: short-lived Infisical token (limited agent identity) for CLIs like aws; ALWAYS needs approval with a
   must-tick "give token" box; refuses lifetimes over 1 h; shows the identity's measured access (read scope, can it write?). The agent identity belongs only to a separate small project (`AGENT_PROJECT_ID`, "cli-secrets"), not the main one: Infisical's plan has no per-folder roles, so a separate project is the only way to limit what a token can read. `access_guide`: setup text only. See `docs/agent-access.md`.
-- `get_upload_url`: NO approval by design. Returns a presigned R2 PUT (5 min, signs `If-None-Match: *` so only the first write to the random key succeeds) for the assistant to `curl -T <file>`, plus a presigned GET (1 h) to hand to other APIs. Objects live under `tmp/` and a bucket lifecycle rule deletes them after 1 day (the shortest R2 allows); the tool reports whether that rule exists. Needs `R2_ACCOUNT_ID`, `R2_BUCKET` (vars) and `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` (Worker secrets); until set it returns the setup steps.
+- `get_upload_url`: NO approval by design. Returns a presigned R2 PUT (5 min, signs `If-None-Match: *` so only the first write to the random key succeeds) for the assistant to `curl -T <file>` (the curl also sends a `Content-Type` guessed from the file name, which Notion checks), plus a presigned GET (1 h) to hand to other APIs. Objects live under `tmp/` and a bucket lifecycle rule deletes them after 1 day (the shortest R2 allows); the tool reports whether that rule exists. Needs `R2_ACCOUNT_ID`, `R2_BUCKET` (vars) and `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` (Worker secrets); until set it returns the setup steps.
 - Supporting: `list_environments`, `list_folders`, `list_secrets`, `get_secret`, `add_secret`, `update_secret`,
   `delete_secret` (needs `confirm: true`). These never return secret values.
 

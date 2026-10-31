@@ -6,8 +6,9 @@
 import { AwsClient } from "aws4fetch";
 import { commentHosts } from "./hosts";
 import { infisical } from "./infisical";
+import { extensionFor, fetchStored, MAX_STORED_BYTES, saveStored, uploadsConfigured, type UploadEnv } from "./uploads";
 
-export interface ApiCallEnv {
+export interface ApiCallEnv extends UploadEnv {
   INFISICAL_HOST: string;
   INFISICAL_CLIENT_ID: string;
   INFISICAL_CLIENT_SECRET: string;
@@ -22,7 +23,8 @@ export interface ApiCallArgs {
   query?: Record<string, string>;
   body?: unknown;
   body_base64?: string; // raw binary request body (e.g. PUT an object to S3)
-  multipart?: { fields?: Record<string, string>; files: { field?: string; filename: string; content_type?: string; data_base64: string }[] };
+  body_source?: string; // a file stored by get_upload_url (its download URL or key): the Worker reads it and sends it as the raw body
+  multipart?: { fields?: Record<string, string>; files: { field?: string; filename?: string; content_type?: string; data_base64?: string; source?: string }[] };
   auth_type?: "bearer" | "header" | "basic" | "query" | "aws_sigv4";
   secret?: string;
   header_name?: string;
@@ -34,6 +36,7 @@ export interface ApiCallArgs {
   aws_access_key_secret?: string;
   aws_secret_key_secret?: string;
   aws_session_token_secret?: string;
+  save_response?: boolean; // store a 2xx response body in R2 and return a download URL instead of the body (e.g. generated audio)
   environment?: string;
   path?: string;
 }
@@ -55,6 +58,44 @@ export function hostAllowed(host: string, patterns: string[] | undefined): boole
     const p = raw.toLowerCase();
     return p.startsWith("*.") ? h.endsWith(p.slice(1)) && h.length > p.length - 1 : h === p;
   });
+}
+
+// Read a response body, refusing more than cap bytes without buffering the rest.
+async function readCapped(res: Response, cap: number): Promise<Uint8Array> {
+  const tooBig = () => new Error(`Response is too large to save (max ${cap / 1024 / 1024} MB)`);
+  if (Number(res.headers.get("content-length") ?? 0) > cap) { await res.body?.cancel(); throw tooBig(); }
+  const reader = res.body?.getReader();
+  if (!reader) return new Uint8Array();
+  const chunks: Uint8Array[] = [];
+  let n = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    n += value.length;
+    if (n > cap) { await reader.cancel(); throw tooBig(); }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(n);
+  let at = 0;
+  for (const c of chunks) { out.set(c, at); at += c.length; }
+  return out;
+}
+
+function containsBytes(hay: Uint8Array, needle: Uint8Array): boolean {
+  if (needle.length === 0) return false;
+  for (let i = hay.indexOf(needle[0]); i !== -1 && i <= hay.length - needle.length; i = hay.indexOf(needle[0], i + 1)) {
+    let j = 1;
+    while (j < needle.length && hay[i + j] === needle[j]) j++;
+    if (j === needle.length) return true;
+  }
+  return false;
+}
+
+// filename="x.mp3" or filename*=UTF-8''x.mp3
+function dispositionName(v: string | null): string | undefined {
+  const m = v?.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+  if (!m) return undefined;
+  try { return decodeURIComponent(m[1]); } catch { return m[1]; }
 }
 
 function decodeBase64(b64: string): Uint8Array {
@@ -107,8 +148,14 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
     if (headers.has(h)) throw new Error(`The ${h} header is not allowed`);
   }
 
-  const given = [a.body !== undefined && a.body !== null, !!a.body_base64, !!a.multipart].filter(Boolean).length;
-  if (given > 1) throw new Error("Send only one of body, body_base64, multipart");
+  if (a.save_response) {
+    // Checked before the call, so a paid API (e.g. text-to-speech) is not charged for output that cannot be kept.
+    if (!uploadsConfigured(env)) throw new Error("File storage is not set up on this server, so save_response cannot be used (see get_upload_url for the setup steps)");
+    if (method === "HEAD") throw new Error("save_response needs a response body; HEAD has none");
+  }
+
+  const given = [a.body !== undefined && a.body !== null, !!a.body_base64, !!a.body_source, !!a.multipart].filter(Boolean).length;
+  if (given > 1) throw new Error("Send only one of body, body_base64, body_source, multipart");
   let body: string | Uint8Array | FormData | undefined;
   let uploadBytes = 0;
   if (a.body !== undefined && a.body !== null) {
@@ -120,15 +167,29 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
   } else if (a.body_base64) {
     body = decodeBase64(a.body_base64);
     uploadBytes = body.length;
+  } else if (a.body_source) {
+    const f = await fetchStored(env, a.body_source);
+    body = f.bytes;
+    uploadBytes = f.bytes.length;
+    if (!headers.has("content-type")) headers.set("content-type", f.contentType);
   } else if (a.multipart) {
     if (a.auth_type === "aws_sigv4") throw new Error("multipart is not supported with aws_sigv4; use body_base64");
     const fd = new FormData();
     for (const [k, v] of Object.entries(a.multipart.fields ?? {})) fd.append(k, v);
     for (const f of a.multipart.files) {
-      const bytes = decodeBase64(f.data_base64);
+      if (!!f.data_base64 === !!f.source) throw new Error("Each file needs exactly one of data_base64 or source");
+      let bytes: Uint8Array, type = f.content_type, name = f.filename;
+      if (f.source) {
+        const st = await fetchStored(env, f.source);
+        bytes = st.bytes; type ??= st.contentType; name ??= st.name;
+      } else {
+        bytes = decodeBase64(f.data_base64!);
+      }
+      if (!name) throw new Error("filename is required with data_base64");
       uploadBytes += bytes.length;
-      if (uploadBytes > MAX_UPLOAD) throw new Error(`Upload too large (max ${MAX_UPLOAD / 1024 / 1024} MB in total)`);
-      fd.append(f.field ?? "file", new Blob([bytes], { type: f.content_type ?? "application/octet-stream" }), f.filename);
+      const cap = a.multipart.files.some((x) => x.source) ? MAX_STORED_BYTES : MAX_UPLOAD;
+      if (uploadBytes > cap) throw new Error(`Upload too large (max ${cap / 1024 / 1024} MB in total)`);
+      fd.append(f.field ?? "file", new Blob([bytes], { type: type ?? "application/octet-stream" }), name);
     }
     headers.delete("content-type"); // fetch sets multipart/form-data with the boundary
     body = fd;
@@ -176,9 +237,22 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
   // Never follow redirects: the next hop could be a host the secret is not bound to.
   const res = await fetch(req, { redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });
   const redact = (s: string) => used.filter((u) => u.length >= 6).reduce((t, u) => t.split(u).join("[REDACTED]"), s);
-  const text = await res.text();
   const out: Record<string, string> = {};
   for (const k of KEEP_HEADERS) { const v = res.headers.get(k); if (v) out[k] = redact(v); }
+
+  if (a.save_response && res.ok) {
+    const bytes = await readCapped(res, MAX_STORED_BYTES);
+    // Binary output cannot be redacted without corrupting it, so a response that carries the credential is not stored at all.
+    const enc = new TextEncoder();
+    if (used.some((u) => u.length >= 6 && containsBytes(bytes, enc.encode(u)))) throw new Error("The response contains the credential itself, so it was not saved");
+    const contentType = (res.headers.get("content-type") ?? "application/octet-stream").slice(0, 200);
+    const filename = dispositionName(res.headers.get("content-disposition")) ?? `response.${extensionFor(contentType)}`;
+    const saved = await saveStored(env, bytes, { filename, contentType });
+    console.log(JSON.stringify({ api_request: { host: url.hostname, method, status: res.status, auth: authType, upload_bytes: uploadBytes || undefined, saved_bytes: bytes.length } }));
+    return { status: res.status, ok: res.ok, headers: out, saved };
+  }
+
+  const text = await res.text();
   console.log(JSON.stringify({ api_request: { host: url.hostname, method, status: res.status, auth: authType, upload_bytes: uploadBytes || undefined } }));
   return {
     status: res.status,
@@ -187,5 +261,6 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
     body: redact(text.length > MAX_BODY ? text.slice(0, MAX_BODY) : text),
     truncated: text.length > MAX_BODY,
     ...(res.status >= 300 && res.status < 400 ? { note: "Redirects are not followed; call the Location URL explicitly if its host is allowed." } : {}),
+    ...(a.save_response && !res.ok ? { not_saved: "The API did not return a success status, so its body is shown instead of being saved." } : {}),
   };
 }
