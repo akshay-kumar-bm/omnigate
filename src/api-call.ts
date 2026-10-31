@@ -43,7 +43,7 @@ export interface ApiCallArgs {
 
 const MAX_BODY = 60_000;
 const MAX_UPLOAD = 5 * 1024 * 1024; // decoded bytes, per request
-const TIMEOUT_MS = 25_000;
+const TIMEOUT_MS = 180_000; // slow APIs (e.g. high-quality image generation) take minutes to respond
 const KEEP_HEADERS = ["content-type", "link", "location", "retry-after", "etag", "x-request-id", "x-amzn-requestid", "x-ratelimit-remaining", "x-ratelimit-reset"];
 
 // Approved hosts for a secret: only what its own comment says (`hosts: a.com, *.b.com`).
