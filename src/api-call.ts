@@ -37,7 +37,6 @@ export interface ApiCallArgs {
   aws_secret_key_secret?: string;
   aws_session_token_secret?: string;
   save_response?: boolean; // store a 2xx response body in R2 and return a download URL instead of the body (e.g. generated audio)
-  save_filename?: string;
   environment?: string;
   path?: string;
 }
@@ -247,7 +246,7 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
     const enc = new TextEncoder();
     if (used.some((u) => u.length >= 6 && containsBytes(bytes, enc.encode(u)))) throw new Error("The response contains the credential itself, so it was not saved");
     const contentType = (res.headers.get("content-type") ?? "application/octet-stream").slice(0, 200);
-    const filename = a.save_filename ?? dispositionName(res.headers.get("content-disposition")) ?? `response.${extensionFor(contentType)}`;
+    const filename = dispositionName(res.headers.get("content-disposition")) ?? `response.${extensionFor(contentType)}`;
     const saved = await saveStored(env, bytes, { filename, contentType });
     console.log(JSON.stringify({ api_request: { host: url.hostname, method, status: res.status, auth: authType, upload_bytes: uploadBytes || undefined, saved_bytes: bytes.length } }));
     return { status: res.status, ok: res.ok, headers: out, saved };

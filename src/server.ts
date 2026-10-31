@@ -127,7 +127,6 @@ export function createServer(env: Env) {
           aws_secret_key_secret: secretName.optional().describe("default AWS_SECRET_ACCESS_KEY"),
           aws_session_token_secret: secretName.optional().describe("default AWS_SESSION_TOKEN"),
           save_response: z.boolean().optional().describe("Store a successful (2xx) response body in temporary storage and return saved.download_url instead of the body. Use for binary output such as text-to-speech audio, images or file downloads. Error responses are returned as text as usual."),
-          save_filename: z.string().max(200).optional().describe("File name for the saved response, e.g. voice.mp3. Default: from Content-Disposition, else response.<ext from Content-Type>."),
           ...loc,
           ...approvalField,
           path: z.string().optional().describe("Folder of the secret, e.g. /notion. If omitted, the secret is found by name in any folder (an error if the name exists in several)."),
