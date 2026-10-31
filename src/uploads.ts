@@ -122,7 +122,7 @@ export async function createUpload(e: UploadEnv, a: { filename?: string; content
 // Only objects this feature created are readable: the reference must be a key (or the download URL) under tmp/<uuid>/<name> in our
 // own bucket. Any other URL is refused, so this cannot be used to make the Worker fetch arbitrary addresses. The Worker signs its own
 // request, so the link's expiry does not matter.
-export const MAX_STORED_BYTES = 25 * 1024 * 1024; // the bytes are held in memory (and copied into a form), so keep this well under the Worker's 128 MB
+export const MAX_STORED_BYTES = 40 * 1024 * 1024; // held in memory, briefly twice (chunks + joined copy, or bytes + form), so this is about the safe top under the Worker's 128 MB
 const KEY_RE = /^tmp\/[0-9a-f-]{36}\/[A-Za-z0-9._-]{1,120}$/;
 
 export function storedKey(e: UploadEnv, ref: string): string {
@@ -139,7 +139,7 @@ export function storedKey(e: UploadEnv, ref: string): string {
 export async function fetchStored(e: UploadEnv, ref: string): Promise<{ bytes: Uint8Array; contentType: string; name: string }> {
   if (!uploadsConfigured(e)) throw new Error("File storage is not set up on this server, so source cannot be used");
   const key = storedKey(e, ref);
-  const r = await client(e).fetch(objectUrl(e, key), { signal: AbortSignal.timeout(25_000) });
+  const r = await client(e).fetch(objectUrl(e, key), { signal: AbortSignal.timeout(60_000) });
   if (r.status === 404) throw new Error("The stored file was not found. It may not have been uploaded yet (run the curl first), or it was deleted after a day");
   if (!r.ok) throw new Error(`Could not read the stored file (status ${r.status})`);
   const declared = Number(r.headers.get("content-length") ?? 0);
@@ -160,7 +160,7 @@ export async function saveStored(e: UploadEnv, bytes: Uint8Array, a: { filename:
     method: "PUT",
     headers: { "content-type": a.contentType, "if-none-match": "*" },
     body: bytes,
-    signal: AbortSignal.timeout(25_000),
+    signal: AbortSignal.timeout(60_000),
   });
   if (!r.ok) throw new Error(`Could not save the response to storage (status ${r.status})`);
   const [getUrl, autoDelete] = await Promise.all([presign(e, "GET", key, getSeconds), autoDeleteStatus(e)]);
