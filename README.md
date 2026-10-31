@@ -67,6 +67,13 @@ The uploading machine must be allowed to reach `<account id>.r2.cloudflarestorag
 
 To send the stored file somewhere, pass its download URL to `api_request` as `body_source` (raw body) or as a multipart file's `source` (e.g. Notion `POST /v1/file_uploads/{id}/send`). The Worker reads it from R2 itself, so the bytes never pass through the chat (max 25 MB). Only files stored by `get_upload_url` can be read this way.
 
+The other direction works too: pass `save_response: true` (optional `save_filename`) to `api_request` and a successful response body is written to the same bucket and returned as `saved.download_url` (1 hour, deleted after a day) instead of the body. Use it for binary output, e.g. text-to-speech in one call:
+```json
+{ "url": "https://api.elevenlabs.io/v1/text-to-speech/<voice id>", "method": "POST", "auth_type": "header", "header_name": "xi-api-key",
+  "secret": "ELEVENLABS_API_KEY", "body": { "text": "Hello", "model_id": "eleven_multilingual_v2" }, "save_response": true, "save_filename": "hello.mp3" }
+```
+Max 25 MB. Error statuses come back as text and are not saved. A response that contains the secret itself is refused rather than stored (binary can't be redacted). Storage is checked before the call, so a paid API is not charged for output that can't be kept. The saved file can be forwarded with `body_source`.
+
 ## Temporary tokens for CLIs (`issue_temp_token`)
 For tools that need credentials in their own environment (the AWS CLI, terraform), `issue_temp_token` gives the assistant a short-lived Infisical token to use with `infisical run -- <command>`. **Every request needs a person**: the approval page shows the purpose, project, folder and the token's lifetime, and the approver must tick a "give token" box (enforced on the server). The token comes from a separate limited "agent" identity (Worker secrets `AGENT_INFISICAL_CLIENT_ID` / `AGENT_INFISICAL_CLIENT_SECRET`), never the server's own, and the server refuses to hand out one that lives longer than 1 hour. Not set up yet? The tool says so and returns the steps. Full guide (agent identity, AWS CLI, running the Agent Proxy server): [docs/agent-access.md](docs/agent-access.md), also available from the `access_guide` tool.
 

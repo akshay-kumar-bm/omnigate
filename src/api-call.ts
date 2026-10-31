@@ -6,7 +6,7 @@
 import { AwsClient } from "aws4fetch";
 import { commentHosts } from "./hosts";
 import { infisical } from "./infisical";
-import { fetchStored, MAX_STORED_BYTES, type UploadEnv } from "./uploads";
+import { extensionFor, fetchStored, MAX_STORED_BYTES, saveStored, uploadsConfigured, type UploadEnv } from "./uploads";
 
 export interface ApiCallEnv extends UploadEnv {
   INFISICAL_HOST: string;
@@ -36,6 +36,8 @@ export interface ApiCallArgs {
   aws_access_key_secret?: string;
   aws_secret_key_secret?: string;
   aws_session_token_secret?: string;
+  save_response?: boolean; // store a 2xx response body in R2 and return a download URL instead of the body (e.g. generated audio)
+  save_filename?: string;
   environment?: string;
   path?: string;
 }
@@ -57,6 +59,44 @@ export function hostAllowed(host: string, patterns: string[] | undefined): boole
     const p = raw.toLowerCase();
     return p.startsWith("*.") ? h.endsWith(p.slice(1)) && h.length > p.length - 1 : h === p;
   });
+}
+
+// Read a response body, refusing more than cap bytes without buffering the rest.
+async function readCapped(res: Response, cap: number): Promise<Uint8Array> {
+  const tooBig = () => new Error(`Response is too large to save (max ${cap / 1024 / 1024} MB)`);
+  if (Number(res.headers.get("content-length") ?? 0) > cap) { await res.body?.cancel(); throw tooBig(); }
+  const reader = res.body?.getReader();
+  if (!reader) return new Uint8Array();
+  const chunks: Uint8Array[] = [];
+  let n = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    n += value.length;
+    if (n > cap) { await reader.cancel(); throw tooBig(); }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(n);
+  let at = 0;
+  for (const c of chunks) { out.set(c, at); at += c.length; }
+  return out;
+}
+
+function containsBytes(hay: Uint8Array, needle: Uint8Array): boolean {
+  if (needle.length === 0) return false;
+  for (let i = hay.indexOf(needle[0]); i !== -1 && i <= hay.length - needle.length; i = hay.indexOf(needle[0], i + 1)) {
+    let j = 1;
+    while (j < needle.length && hay[i + j] === needle[j]) j++;
+    if (j === needle.length) return true;
+  }
+  return false;
+}
+
+// filename="x.mp3" or filename*=UTF-8''x.mp3
+function dispositionName(v: string | null): string | undefined {
+  const m = v?.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+  if (!m) return undefined;
+  try { return decodeURIComponent(m[1]); } catch { return m[1]; }
 }
 
 function decodeBase64(b64: string): Uint8Array {
@@ -107,6 +147,12 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
   // A POST that an API treats as DELETE would dodge the approval required for DELETE.
   for (const h of ["x-http-method-override", "x-method-override", "x-http-method"]) {
     if (headers.has(h)) throw new Error(`The ${h} header is not allowed`);
+  }
+
+  if (a.save_response) {
+    // Checked before the call, so a paid API (e.g. text-to-speech) is not charged for output that cannot be kept.
+    if (!uploadsConfigured(env)) throw new Error("File storage is not set up on this server, so save_response cannot be used (see get_upload_url for the setup steps)");
+    if (method === "HEAD") throw new Error("save_response needs a response body; HEAD has none");
   }
 
   const given = [a.body !== undefined && a.body !== null, !!a.body_base64, !!a.body_source, !!a.multipart].filter(Boolean).length;
@@ -192,9 +238,22 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
   // Never follow redirects: the next hop could be a host the secret is not bound to.
   const res = await fetch(req, { redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });
   const redact = (s: string) => used.filter((u) => u.length >= 6).reduce((t, u) => t.split(u).join("[REDACTED]"), s);
-  const text = await res.text();
   const out: Record<string, string> = {};
   for (const k of KEEP_HEADERS) { const v = res.headers.get(k); if (v) out[k] = redact(v); }
+
+  if (a.save_response && res.ok) {
+    const bytes = await readCapped(res, MAX_STORED_BYTES);
+    // Binary output cannot be redacted without corrupting it, so a response that carries the credential is not stored at all.
+    const enc = new TextEncoder();
+    if (used.some((u) => u.length >= 6 && containsBytes(bytes, enc.encode(u)))) throw new Error("The response contains the credential itself, so it was not saved");
+    const contentType = (res.headers.get("content-type") ?? "application/octet-stream").slice(0, 200);
+    const filename = a.save_filename ?? dispositionName(res.headers.get("content-disposition")) ?? `response.${extensionFor(contentType)}`;
+    const saved = await saveStored(env, bytes, { filename, contentType });
+    console.log(JSON.stringify({ api_request: { host: url.hostname, method, status: res.status, auth: authType, upload_bytes: uploadBytes || undefined, saved_bytes: bytes.length } }));
+    return { status: res.status, ok: res.ok, headers: out, saved };
+  }
+
+  const text = await res.text();
   console.log(JSON.stringify({ api_request: { host: url.hostname, method, status: res.status, auth: authType, upload_bytes: uploadBytes || undefined } }));
   return {
     status: res.status,
@@ -203,5 +262,6 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
     body: redact(text.length > MAX_BODY ? text.slice(0, MAX_BODY) : text),
     truncated: text.length > MAX_BODY,
     ...(res.status >= 300 && res.status < 400 ? { note: "Redirects are not followed; call the Location URL explicitly if its host is allowed." } : {}),
+    ...(a.save_response && !res.ok ? { not_saved: "The API did not return a success status, so its body is shown instead of being saved." } : {}),
   };
 }

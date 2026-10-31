@@ -32,6 +32,12 @@ export function contentTypeFor(filename: string, given?: string): string {
   if (given && /^[A-Za-z0-9.+-]+\/[A-Za-z0-9.+-]+$/.test(given)) return given;
   return MIME[filename.split(".").pop()?.toLowerCase() ?? ""] ?? "application/octet-stream";
 }
+// The reverse, for naming a saved API response: "audio/mpeg; charset=x" -> "mp3".
+const EXTRA_EXT: Record<string, string> = { "audio/mp3": "mp3", "audio/wav": "wav", "audio/x-wav": "wav", "audio/wave": "wav", "audio/ogg": "ogg", "audio/opus": "opus", "audio/aac": "aac", "audio/flac": "flac", "audio/webm": "webm", "video/webm": "webm", "audio/l16": "pcm", "application/octet-stream": "bin" };
+export function extensionFor(contentType: string | null | undefined): string {
+  const t = (contentType ?? "").split(";")[0].trim().toLowerCase();
+  return EXTRA_EXT[t] ?? Object.keys(MIME).find((k) => MIME[k] === t) ?? "bin";
+}
 
 export const uploadsConfigured = (e: UploadEnv) => !!(e.R2_ACCOUNT_ID && e.R2_BUCKET && e.R2_ACCESS_KEY_ID && e.R2_SECRET_ACCESS_KEY);
 
@@ -141,4 +147,30 @@ export async function fetchStored(e: UploadEnv, ref: string): Promise<{ bytes: U
   const bytes = new Uint8Array(await r.arrayBuffer());
   if (bytes.length > MAX_STORED_BYTES) throw new Error(`Stored file is too large to forward (max ${MAX_STORED_BYTES / 1024 / 1024} MB)`);
   return { bytes, contentType: r.headers.get("content-type") ?? "application/octet-stream", name: key.split("/").pop()! };
+}
+
+// The download side: api_request's save_response writes an API's response (e.g. generated audio) here instead of returning it,
+// so binary output never passes through the chat. Same key layout, expiry and 1-day delete rule as get_upload_url, so the
+// saved file can also be sent on with body_source / multipart source.
+export async function saveStored(e: UploadEnv, bytes: Uint8Array, a: { filename: string; contentType: string }) {
+  if (!uploadsConfigured(e)) throw new Error("File storage is not set up on this server, so save_response cannot be used");
+  const getSeconds = seconds(e.UPLOAD_GET_SECONDS, GET_DEFAULT, GET_MAX);
+  const key = `${UPLOAD_PREFIX}${crypto.randomUUID()}/${safeName(a.filename)}`;
+  const r = await client(e).fetch(objectUrl(e, key), {
+    method: "PUT",
+    headers: { "content-type": a.contentType, "if-none-match": "*" },
+    body: bytes,
+    signal: AbortSignal.timeout(25_000),
+  });
+  if (!r.ok) throw new Error(`Could not save the response to storage (status ${r.status})`);
+  const [getUrl, autoDelete] = await Promise.all([presign(e, "GET", key, getSeconds), autoDeleteStatus(e)]);
+  return {
+    download_url: getUrl,
+    expires_in_seconds: getSeconds,
+    key,
+    bytes: bytes.length,
+    content_type: a.contentType,
+    auto_delete: autoDelete,
+    note: "Anyone with the link can read the file until it expires. To send it to another API, pass the URL as body_source or a multipart file's source.",
+  };
 }
