@@ -109,6 +109,14 @@ function decodeBase64(b64: string): Uint8Array {
 // token on every refresh are not supported: this server cannot write the new one back to Infisical.
 const tokenCache = new Map<string, { token: string; expires: number }>();
 
+export function isOAuthSecret(value: string): boolean {
+  if (!value.trimStart().startsWith("{")) return false;
+  try {
+    const v = JSON.parse(value);
+    return typeof v?.refresh_token === "string" && typeof v?.token_url === "string";
+  } catch { return false; }
+}
+
 async function oauthAccessToken(name: string, value: string, approved: string[], used: string[]): Promise<string> {
   let cfg: Record<string, unknown>;
   try { cfg = JSON.parse(value); } catch { cfg = {}; }
@@ -182,7 +190,7 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
   for (const [k, v] of Object.entries(a.query ?? {})) url.searchParams.set(k, v);
 
   const method = (a.method ?? "GET").toUpperCase();
-  const authType = a.auth_type ?? "bearer";
+  let authType = a.auth_type ?? "bearer"; // may become oauth2_refresh once the secret is read (see below)
   const used: string[] = []; // secret values, for redaction
   const read = async (name: string) => {
     const secret = await loadSecret(env, name, a);
@@ -260,6 +268,13 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
   };
 
   const { value, approved } = await read(need(a.secret, "secret"));
+  // An OAuth secret (JSON with a refresh token) must never be sent as is: as a Bearer token it is useless (the API
+  // answers 401) and it would put the refresh token and client secret in a request header. Models often leave
+  // auth_type out, so bearer (the default) on such a secret means oauth2_refresh; any other type is refused.
+  if (authType !== "oauth2_refresh" && isOAuthSecret(value)) {
+    if (authType !== "bearer") throw new Error(`Secret ${a.secret} is an OAuth refresh-token secret; call api_request with auth_type "oauth2_refresh" (or leave auth_type out)`);
+    authType = "oauth2_refresh";
+  }
   if (authType === "bearer") { injected("authorization"); headers.set("authorization", `Bearer ${value}`); }
   else if (authType === "oauth2_refresh") {
     injected("authorization");

@@ -104,7 +104,7 @@ export const gmailDraftSendId = (u: URL, body: unknown): string | null =>
   isGmailSend(u) && /\/drafts\/send$/.test(u.pathname.replace(/\/+$/, "")) && body && typeof body === "object" && typeof (body as any).id === "string" && /^[A-Za-z0-9_-]+$/.test((body as any).id) ? (body as any).id : null;
 
 export interface RequestLike {
-  method: string; url: string; secret: string; auth_type: string;
+  method: string; url: string; secret: string; auth_type?: string;
   query?: Record<string, string>; body?: unknown; body_base64?: string; body_source?: string; multipart?: unknown; save_response?: boolean;
 }
 
@@ -119,7 +119,7 @@ export function describeRequest(a: RequestLike, why: string, draft?: Row[]): { t
     ["Path", path],
     ...(u.search ? [["Query", decodeURIComponent(u.search.slice(1)).replace(/&/g, "  &  ")] as Row] : []),
     ["Why asked", why],
-    ["Credential", `${a.secret} (${a.auth_type})`],
+    ["Credential", a.auth_type ? `${a.secret} (${a.auth_type})` : a.secret],
   ];
   if (isGmailSend(u)) {
     const raw = a.body && typeof a.body === "object" ? ((a.body as any).raw ?? (a.body as any).message?.raw) : undefined;
