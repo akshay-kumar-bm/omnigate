@@ -1,7 +1,7 @@
 # universal-api-mcp
 
 Remote MCP server (Cloudflare Worker, TypeScript) that lets Claude call **any HTTPS API or integration**
-(GitHub, Jira, Notion, Stripe, AWS, ...) using credentials kept in Infisical. The model passes a secret
+(GitHub, Jira, Notion, Stripe, Google, ...) using credentials kept in Infisical. The model passes a secret
 **name**; the Worker reads the value, adds the auth, calls the API and returns the response with the secret
 redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALLOWED_EMAILS`.
 
@@ -25,7 +25,11 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 
 ## Tools
 - **`api_request`** (main): authenticated HTTPS call. `auth_type`: bearer (default), header, basic, query,
-  aws_sigv4. Uploads: `multipart` or `body_base64` (5 MB cap), or `body_source` / a multipart file's `source` = the download URL (or key) from `get_upload_url`: the Worker reads the stored file from R2 itself and forwards it (40 MB cap, held in memory); only keys under `tmp/<uuid>/` in our bucket are readable, never other URLs (`fetchStored` in `src/uploads.ts`). Redirects are not followed. Upstream timeout is 3 minutes (`TIMEOUT_MS` in `src/api-call.ts`; high-quality image generation needs it).
+  oauth2_refresh. `secret` is always required. There is no AWS SigV4 any more (removed on purpose; use `issue_temp_token` + the aws CLI).
+  `oauth2_refresh` (Google, Microsoft, ...): the secret is JSON `{client_id, client_secret?, refresh_token, token_url, scope?}`;
+  the Worker posts the refresh token to `token_url` (its host must also be in the secret's `hosts:` line), caches the access
+  token per isolate until a minute before expiry, sends it as Bearer and redacts all three values. Providers that invalidate
+  the old refresh token on each refresh are not supported (the server cannot write secrets). Uploads: `multipart` or `body_base64` (5 MB cap), or `body_source` / a multipart file's `source` = the download URL (or key) from `get_upload_url`: the Worker reads the stored file from R2 itself and forwards it (40 MB cap, held in memory); only keys under `tmp/<uuid>/` in our bucket are readable, never other URLs (`fetchStored` in `src/uploads.ts`). Redirects are not followed. Upstream timeout is 3 minutes (`TIMEOUT_MS` in `src/api-call.ts`; high-quality image generation needs it).
   Downloads: `save_response: true` stores a 2xx body in R2 (`saveStored`, same `tmp/<uuid>/` keys) and returns a presigned
   download URL instead of the body (40 MB cap; refused if the bytes contain the secret; storage checked before the call).
 - `issue_temp_token`: short-lived Infisical token (limited agent identity) for CLIs like aws; ALWAYS needs approval with a
@@ -37,13 +41,13 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
   always uses `dev`. Do not add them back without being asked. All tool results are compact JSON (no indentation).
 
 **Approvals:** destructive `api_request` calls (DELETE, GraphQL delete/archive-style mutations, bodies setting
-archived/trashed/deleted true; see `src/destructive.ts`) and every `issue_temp_token` need a human: the
+archived/trashed/deleted true, URLs ending in /trash, /delete, /batchDelete, /emptyTrash or `:delete`, and Gmail send; see `src/destructive.ts`) and every `issue_temp_token` need a human: the
 first call returns `approval_required` + a link (`src/approvals.ts`); the user signs in with Google once (12 h session cookie), then each link is one click; the repeat
 call with `approval_id` runs once, only for the exact same arguments, within 15 minutes. Never bypass or weaken this.
 
 The approval page (`src/approvals.ts`) is script-free; a request can carry an `ack` checkbox that the server enforces.
 
-**Folders:** secrets live in one Infisical folder per service (`/notion`, `/github`, `/linear`, `/tavily`, `/firecrawl`).
+**Folders:** secrets live in one Infisical folder per service (`/notion`, `/github`, `/linear`, `/tavily`, `/firecrawl`, `/google`).
 `api_request` finds a secret by name in any folder (error if the name exists in several; pass `path`).
 
 **Host binding (deny by default):** a secret can only be sent to the hosts in its own comment, a `hosts: a.com, *.b.com`

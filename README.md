@@ -2,7 +2,7 @@
 
 Universal API MCP server. (The Cloudflare Worker is still named `infisical-mcp`, so its URL and the Google redirect URI are unchanged.)
 
-One MCP server that lets Claude call **any HTTPS API or integration** (GitHub, Jira, Notion, Stripe, Slack, AWS, ...) with credentials kept in Infisical, so the model never sees a token. Runs on Cloudflare Workers (free plan) behind Google sign-in.
+One MCP server that lets Claude call **any HTTPS API or integration** (GitHub, Jira, Notion, Stripe, Slack, Google, ...) with credentials kept in Infisical, so the model never sees a token. Runs on Cloudflare Workers (free plan) behind Google sign-in.
 
 Four tools: **`api_request`** (main), `list_secrets` (which credentials exist and where each may be sent), `issue_temp_token` and `get_upload_url` (below). The server cannot create, change or delete secrets: the owner manages them in the Infisical dashboard. The tool list is kept short on purpose, so small models spend fewer tokens on it.
 
@@ -14,9 +14,18 @@ Connect this MCP to any Claude session and it can call any HTTPS API or integrat
 ```
 api_request { url: "https://api.notion.com/v1/users/me", secret: "NOTION_TOKEN", headers: { "Notion-Version": "2022-06-28" } }
 api_request { url: "https://api.github.com/user", secret: "GH_TOKEN" }
-api_request { url: "https://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15", auth_type: "aws_sigv4", aws_service: "sts", aws_region: "us-east-1" }
+api_request { url: "https://gmail.googleapis.com/gmail/v1/users/me/messages", auth_type: "oauth2_refresh", secret: "GOOGLE_OAUTH" }
 ```
-`auth_type`: `bearer` (default), `header` (`header_name`, `header_prefix`), `basic` (`secret` = `user:pass`, or `username` + secret as password), `query` (`query_param`), `aws_sigv4` (uses the secrets `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`).
+`auth_type`: `bearer` (default), `header` (`header_name`, `header_prefix`), `basic` (`secret` = `user:pass`, or `username` + secret as password), `query` (`query_param`), `oauth2_refresh` (below).
+
+**OAuth APIs (Google, Microsoft, ...): `oauth2_refresh`.** These need a short-lived access token instead of a fixed key. Store one secret whose value is JSON, and the Worker trades the refresh token for an access token (cached until a minute before it expires) and sends it as `Bearer`:
+```
+name:    GOOGLE_OAUTH            (folder /google)
+value:   {"client_id":"...","client_secret":"...","refresh_token":"...","token_url":"https://oauth2.googleapis.com/token"}
+comment: hosts: *.googleapis.com
+```
+`token_url`'s host must also be in the `hosts:` line (for Microsoft: `hosts: graph.microsoft.com, login.microsoftonline.com`), so the refresh token only goes where you allowed. Optional `scope` is sent with the refresh (Microsoft wants it). Providers that invalidate the old refresh token on every refresh are not supported, because this server never writes secrets.
+Google one-time setup: Google Cloud Console → enable the APIs (Gmail, Drive, Calendar, ...) → OAuth consent screen, publishing status **In production** (unverified is fine for your own account; in Testing mode Google expires refresh tokens after 7 days) → Credentials → OAuth client of type **Desktop app** (not the Worker's sign-in client) → get a refresh token once (e.g. OAuth Playground with "use your own credentials", or a local script) with the scopes you want → paste the JSON into Infisical.
 
 **File uploads.** `multipart` sends a `multipart/form-data` form with files; `body_base64` sends raw bytes. Both take base64 data, up to 5 MB decoded per request, and cannot be combined with `body`. Example, uploading an image to a Notion row (the same two calls the Notion docs describe):
 ```
@@ -24,7 +33,6 @@ api_request { url: "https://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentit
 2. api_request { url: "https://api.notion.com/v1/file_uploads/<id>/send", method: "POST", secret: "NOTION_TOKEN", headers: { "Notion-Version": "2022-06-28" }, multipart: { files: [{ filename: "card.png", content_type: "image/png", data_base64: "<...>" }] } }
 3. api_request { url: "https://api.notion.com/v1/pages/<page>", method: "PATCH", secret: "NOTION_TOKEN", headers: { "Notion-Version": "2022-06-28" }, body: { properties: { Image: { files: [{ name: "card.png", type: "file_upload", file_upload: { id: "<id>" } }] } } } }
 ```
-S3: `PUT https://<bucket>.s3.<region>.amazonaws.com/<key>` with `auth_type: aws_sigv4`, `aws_service: s3` and `body_base64`.
 
 **Safety rules**
 - A secret can only be sent to the hosts in **its own comment**, a line like `hosts: api.example.com, *.example.com`. There is no built-in list and no config var: no `hosts:` line means the secret is never sent anywhere (fine for IDs and config).
@@ -40,7 +48,7 @@ S3: `PUT https://<bucket>.s3.<region>.amazonaws.com/<key>` with `auth_type: aws_
 
 ## Approval for destructive actions
 These always need a human, enforced by the server (not by the model):
-- `api_request` that is destructive: method `DELETE`; a GraphQL mutation whose field names contain delete/destroy/remove/archive/purge/trash (e.g. Linear `issueDelete`); or a JSON body that sets `archived`/`trashed`/`deleted`/`in_trash` to `true` (how Notion and GitHub archive).
+- `api_request` that is destructive: method `DELETE`; a GraphQL mutation whose field names contain delete/destroy/remove/archive/purge/trash (e.g. Linear `issueDelete`); a JSON body that sets `archived`/`trashed`/`deleted`/`in_trash` to `true` (how Notion and GitHub archive); a URL whose last part is a trash/delete action (`/trash`, `/delete`, `/batchDelete`, `/emptyTrash`, `:delete`, e.g. Gmail `POST .../messages/{id}/trash`); or Gmail send (`.../messages/send`, `.../drafts/send`), which can't be undone.
 
 Everything else (reads, creates, other writes) runs automatically.
 1. The first call returns `approval_required` with an `approve_url` and does nothing.
