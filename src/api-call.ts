@@ -134,7 +134,7 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
       throw new Error(
         `Secret ${name} is not allowed to be sent to ${url.hostname}. ` +
         (approved.length ? `Approved hosts for it: ${approved.join(", ")}. ` : "No hosts are approved for it. ") +
-        "Hosts come from the secret's comment (a 'hosts: ...' line), are set when the secret is stored (add_secret hosts) and cannot be changed through this server; the owner can edit the comment in Infisical.",
+        "Hosts come from the secret's comment (a 'hosts: ...' line), and only the owner can set them, in Infisical. Tell the user.",
       );
     }
     used.push(secret.value);

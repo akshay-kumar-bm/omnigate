@@ -4,12 +4,12 @@ Universal API MCP server. (The Cloudflare Worker is still named `infisical-mcp`,
 
 One MCP server that lets Claude call **any HTTPS API or integration** (GitHub, Jira, Notion, Stripe, Slack, AWS, ...) with credentials kept in Infisical, so the model never sees a token. Runs on Cloudflare Workers (free plan) behind Google sign-in.
 
-Main tool: **`api_request`**. Also `issue_temp_token`, `get_upload_url` and `access_guide` (below). Supporting tools for the credentials it uses: `list_environments`, `list_folders`, `list_secrets`, `get_secret`, `add_secret`, `update_secret`, `delete_secret` (needs `confirm: true`).
+Four tools: **`api_request`** (main), `list_secrets` (which credentials exist and where each may be sent), `issue_temp_token` and `get_upload_url` (below). The server cannot create, change or delete secrets: the owner manages them in the Infisical dashboard. The tool list is kept short on purpose, so small models spend fewer tokens on it.
 
-**Values never come back to the client.** List/get use `viewSecretValue=false` and responses are redacted. `add_secret`/`update_secret` do pass the new value through the MCP client once.
+**Values never come back to the client.** `list_secrets` uses `viewSecretValue=false` and returns only name, folder, approved hosts and any note.
 
 ## Making API calls: `api_request`
-Connect this MCP to any Claude session and it can call any HTTPS API or integration with a stored token without ever seeing the token. To connect a new integration: `add_secret` its token with `hosts`. No redeploy needed. The model passes the secret *name*; the Worker reads the value from Infisical, adds the auth, calls the API and returns only the response (the token is redacted from it).
+Connect this MCP to any Claude session and it can call any HTTPS API or integration with a stored token without ever seeing the token. To connect a new integration: add its token in Infisical with a `hosts:` comment line (below). No redeploy needed. The model passes the secret *name*; the Worker reads the value from Infisical, adds the auth, calls the API and returns only the response (the token is redacted from it).
 
 ```
 api_request { url: "https://api.notion.com/v1/users/me", secret: "NOTION_TOKEN", headers: { "Notion-Version": "2022-06-28" } }
@@ -28,23 +28,21 @@ S3: `PUT https://<bucket>.s3.<region>.amazonaws.com/<key>` with `auth_type: aws_
 
 **Safety rules**
 - A secret can only be sent to the hosts in **its own comment**, a line like `hosts: api.example.com, *.example.com`. There is no built-in list and no config var: no `hosts:` line means the secret is never sent anywhere (fine for IDs and config).
-  - `add_secret` takes `hosts` and writes that line. It is visible in Infisical and as `approved_hosts` in `list_secrets`/`get_secret`.
-  - Hosts are **fixed at creation**: `update_secret` keeps the line and drops any `hosts:` typed into a new comment, so a tricked model can't point an existing token at another site. The owner can edit the comment in the Infisical dashboard.
+  - Only the owner writes that line, in the Infisical dashboard; no tool can create or edit a secret, so a tricked model can't point a token at another site. It shows as `hosts` in `list_secrets`.
   - Hosts must be bare hostnames (no scheme, path, port, IP or internal domain). Wildcards need two labels (`*.example.com`, matches any subdomain depth, never the bare domain) and are refused on shared-hosting domains such as `*.workers.dev` or `*.github.io`.
-  - To connect a new service: `add_secret` its token with `hosts` (e.g. `["api.linear.app"]`). No redeploy.
+  - To connect a new service: add the token in Infisical, in its own folder (e.g. `/linear`), with the comment `hosts: api.linear.app`. No redeploy.
 - Secret references (`${OTHER}`) are not expanded when `api_request` reads a value, so a secret can't be used to leak another secret.
-- HTTPS only, default port only, redirects are not followed, 25 s timeout, response body capped at 60 KB, uploads capped at 5 MB, secrets redacted from the body and headers. The client may not set its own `Authorization` header.
-- Secrets are read from `DEFAULT_ENVIRONMENT` (`dev`) unless `environment` is passed. Keep one Infisical folder per service (`/notion`, `/github`, ...): `api_request` finds a secret by name in any folder, refuses to guess if the same name is in several (pass `path`), and `list_secrets` searches all folders by default. `add_secret` takes `path` to choose the folder.
+- HTTPS only, default port only, redirects are not followed, 3-minute timeout, response body capped at 60 KB, uploads capped at 5 MB, secrets redacted from the body and headers. The client may not set its own `Authorization` header.
+- Secrets are read from `DEFAULT_ENVIRONMENT` (`dev`) unless `environment` is passed. Keep one Infisical folder per service (`/notion`, `/github`, ...): `api_request` finds a secret by name in any folder, refuses to guess if the same name is in several (pass `path`), and `list_secrets` searches all folders by default.
 - This is not a shell: it cannot run CLIs like `aws` or `gh`. For those, use `infisical run --env=dev -- <cmd>` in a session that has the Infisical CLI.
   - With a token from `issue_temp_token`: `infisical run --token="$INFISICAL_TOKEN" --domain=https://us.infisical.com --projectId=<id> --env=dev --path=/github -- gh api user`. Use the real command after `--`, not another `infisical run`.
   - To clone with the injected token use `git` (e.g. `-c http.extraheader=...`), not `gh repo clone`: that uses GraphQL, which Claude Code sessions can't call.
 
 ## Approval for destructive actions
 These always need a human, enforced by the server (not by the model):
-- `delete_secret`, and `update_secret` with a new value or name.
 - `api_request` that is destructive: method `DELETE`; a GraphQL mutation whose field names contain delete/destroy/remove/archive/purge/trash (e.g. Linear `issueDelete`); or a JSON body that sets `archived`/`trashed`/`deleted`/`in_trash` to `true` (how Notion and GitHub archive).
 
-Everything else (reads, creates, other writes, comment-only edits) runs automatically.
+Everything else (reads, creates, other writes) runs automatically.
 1. The first call returns `approval_required` with an `approve_url` and does nothing.
 2. The user opens the link. The first time, it goes straight to Google sign-in (an account in `ALLOWED_EMAILS`); that leaves a 12-hour `HttpOnly` session cookie in their browser. After that, every approval link opens directly to a page showing the exact action with **Approve** and **Deny** buttons, so approving is one click. The page has a "Sign out of approvals" button. A model can't do this: it never has the cookie, and the confirm request needs both the cookie and a one-time nonce that was issued for that person and that approval.
 3. The model repeats the identical call with `approval_id`. The approval is bound to the exact tool and arguments (a different URL, name or body is refused), works once, and expires after 15 minutes.
@@ -76,7 +74,7 @@ The file is named from the response's `Content-Disposition`, else `response.<ext
 Max 40 MB. Error statuses come back as text and are not saved. A response that contains the secret itself is refused rather than stored (binary can't be redacted). Storage is checked before the call, so a paid API is not charged for output that can't be kept. The saved file can be forwarded with `body_source`.
 
 ## Temporary tokens for CLIs (`issue_temp_token`)
-For tools that need credentials in their own environment (the AWS CLI, terraform), `issue_temp_token` gives the assistant a short-lived Infisical token to use with `infisical run -- <command>`. **Every request needs a person**: the approval page shows the purpose, project, folder and the token's lifetime, and the approver must tick a "give token" box (enforced on the server). The token comes from a separate limited "agent" identity (Worker secrets `AGENT_INFISICAL_CLIENT_ID` / `AGENT_INFISICAL_CLIENT_SECRET`), never the server's own, and the server refuses to hand out one that lives longer than 1 hour. Not set up yet? The tool says so and returns the steps. Full guide (agent identity, AWS CLI, running the Agent Proxy server): [docs/agent-access.md](docs/agent-access.md), also available from the `access_guide` tool.
+For tools that need credentials in their own environment (the AWS CLI, terraform), `issue_temp_token` gives the assistant a short-lived Infisical token to use with `infisical run -- <command>`. **Every request needs a person**: the approval page shows the purpose, project, folder and the token's lifetime, and the approver must tick a "give token" box (enforced on the server). The token comes from a separate limited "agent" identity (Worker secrets `AGENT_INFISICAL_CLIENT_ID` / `AGENT_INFISICAL_CLIENT_SECRET`), never the server's own, and the server refuses to hand out one that lives longer than 1 hour. Not set up yet? The tool says so and returns the steps. Full guide (agent identity, AWS CLI, running the Agent Proxy server): [docs/agent-access.md](docs/agent-access.md).
 
 ## Deploy
 Pushes to `main` deploy automatically via GitHub Actions (`.github/workflows/deploy.yml`; repo secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`). The steps below are the one-time setup and the manual route.

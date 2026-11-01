@@ -16,7 +16,7 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 - `src/approval-store.ts` / `src/store-core.ts`: the Durable Object and its Node-testable logic (expiry, sweep).
 - `src/destructive.ts`: best-effort detection of destructive api_request calls beyond HTTP DELETE.
 - `src/approvals.ts`: approval records (Durable Object `ApprovalStore`, strongly consistent; KV only as a test fallback), the `/approve/*` pages, and the approval Google sign-in via `/callback` (state `ap.*`).
-- `src/temp-token.ts` / `src/guide.ts`: agent-identity token minting; guide text (also generates `docs/agent-access.md`).
+- `src/temp-token.ts` / `src/guide.ts`: agent-identity token minting; setup/usage text returned by `issue_temp_token` (full guide: `docs/agent-access.md`).
 - `src/uploads.ts`: `get_upload_url` (R2 presigned URLs; setup text lives here).
 - `src/hosts.ts`: validation and parsing of the `hosts:` comment line.
 - `src/infisical.ts`: thin Infisical REST client (Universal Auth). `getSecretValue` is server-side only.
@@ -29,13 +29,15 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
   Downloads: `save_response: true` stores a 2xx body in R2 (`saveStored`, same `tmp/<uuid>/` keys) and returns a presigned
   download URL instead of the body (40 MB cap; refused if the bytes contain the secret; storage checked before the call).
 - `issue_temp_token`: short-lived Infisical token (limited agent identity) for CLIs like aws; ALWAYS needs approval with a
-  must-tick "give token" box; refuses lifetimes over 1 h; shows the identity's measured access (read scope, can it write?). The agent identity belongs only to a separate small project (`AGENT_PROJECT_ID`, "cli-secrets"), not the main one: Infisical's plan has no per-folder roles, so a separate project is the only way to limit what a token can read. `access_guide`: setup text only. See `docs/agent-access.md`.
+  must-tick "give token" box; refuses lifetimes over 1 h; shows the identity's measured access (read scope, can it write?). The agent identity belongs only to a separate small project (`AGENT_PROJECT_ID`, "cli-secrets"), not the main one: Infisical's plan has no per-folder roles, so a separate project is the only way to limit what a token can read. See `docs/agent-access.md`.
 - `get_upload_url`: NO approval by design. Returns a presigned R2 PUT (5 min, signs `If-None-Match: *` so only the first write to the random key succeeds) for the assistant to `curl -T <file>` (the curl also sends a `Content-Type` guessed from the file name, which Notion checks), plus a presigned GET (1 h) to hand to other APIs. Objects live under `tmp/` and a bucket lifecycle rule deletes them after 1 day (the shortest R2 allows); the tool reports whether that rule exists. Needs `R2_ACCOUNT_ID`, `R2_BUCKET` (vars) and `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` (Worker secrets); until set it returns the setup steps.
-- Supporting: `list_environments`, `list_folders`, `list_secrets`, `get_secret`, `add_secret`, `update_secret`,
-  `delete_secret` (needs `confirm: true`). These never return secret values.
+- `list_secrets`: name, folder, approved `hosts` and any note per secret (plus the environment once). Never values; no timestamps or other
+  metadata, to save tokens. That is the whole tool list (4 tools), kept short for small models. There are deliberately NO tools to
+  add, update or delete secrets, list folders/environments or show guides: the owner manages secrets in the Infisical dashboard and
+  always uses `dev`. Do not add them back without being asked. All tool results are compact JSON (no indentation).
 
-**Approvals:** `delete_secret`, `update_secret` (new value or name) and destructive `api_request` calls (DELETE, GraphQL
-delete/archive-style mutations, bodies setting archived/trashed/deleted true; see `src/destructive.ts`) need a human: the
+**Approvals:** destructive `api_request` calls (DELETE, GraphQL delete/archive-style mutations, bodies setting
+archived/trashed/deleted true; see `src/destructive.ts`) and every `issue_temp_token` need a human: the
 first call returns `approval_required` + a link (`src/approvals.ts`); the user signs in with Google once (12 h session cookie), then each link is one click; the repeat
 call with `approval_id` runs once, only for the exact same arguments, within 15 minutes. Never bypass or weaken this.
 
@@ -45,10 +47,8 @@ The approval page (`src/approvals.ts`) is script-free; a request can carry an `a
 `api_request` finds a secret by name in any folder (error if the name exists in several; pass `path`).
 
 **Host binding (deny by default):** a secret can only be sent to the hosts in its own comment, a `hosts: a.com, *.b.com`
-line, written by `add_secret`'s `hosts` argument and locked afterwards (`update_secret` preserves it and strips any
-`hosts:` in new comment text). No built-in list, no config var; no `hosts:` line means never sent. Wildcards need 2
-labels and are refused on shared-hosting domains. `${REF}` secret references are never expanded. Only the owner
-(Infisical dashboard) changes hosts on an existing secret.
+line that only the owner writes, in the Infisical dashboard (no tool can create or edit a secret). No built-in list, no config var; no `hosts:` line means never sent. Wildcards need 2
+labels and are refused on shared-hosting domains. `${REF}` secret references are never expanded.
 
 ## Run
 ```
