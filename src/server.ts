@@ -1,12 +1,13 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { infisical } from "./infisical";
-import { approvedHosts, callApi } from "./api-call";
+import { approvedHosts, callApi, writeApprovalReason } from "./api-call";
+import { describeRequest, draftHeaderRows, gmailDraftSendId, type Row } from "./preview";
 import { checkApproval, requestApproval, type ApprovalSpec } from "./approvals";
 import { agentConfigured, mintAgentToken, probeAccess, type AccessSummary } from "./temp-token";
 import { AGENT_IDENTITY_SETUP, usage } from "./guide";
 import { destructiveReason } from "./destructive";
-import { stripHostsLines } from "./hosts";
+import { commentPolicy, stripHostsLines } from "./hosts";
 import { createUpload, SETUP as UPLOAD_SETUP, uploadsConfigured, type UploadEnv } from "./uploads";
 
 export interface Env extends UploadEnv {
@@ -37,7 +38,12 @@ const ok = (data: unknown) => ({ content: [{ type: "text" as const, text: JSON.s
 // timestamps, version, type, empty tags and the raw comment (its hosts line repeats `hosts`) are left out to save tokens.
 const brief = (s: any) => {
   const note = stripHostsLines(String(s?.secretComment ?? ""));
-  return { name: s?.secretKey, path: s?.secretPath, hosts: approvedHosts(s?.secretComment), ...(note ? { note } : {}) };
+  const policy = commentPolicy(s?.secretComment);
+  return {
+    name: s?.secretKey, path: s?.secretPath, hosts: approvedHosts(s?.secretComment),
+    ...(policy.approveWrites ? { approval: "writes", ...(policy.allow.length ? { allow: policy.allow.map((r) => r.text) } : {}) } : {}),
+    ...(note ? { note } : {}),
+  };
 };
 const fail = (e: unknown) => ({ isError: true, content: [{ type: "text" as const, text: String((e as Error).message ?? e) }] });
 
@@ -48,7 +54,7 @@ const INSTRUCTIONS = [
   "Use api_request for the call itself: pass the secret NAME plus the URL, method and body; the server adds the token and returns the response with the token redacted.",
   "Use list_secrets to see which credentials exist (name, folder, hosts; never values). A secret can only be sent to its listed hosts. The owner adds and edits secrets in Infisical; this server cannot. If a credential is missing or api_request says a host is not allowed, tell the user.",
   "Secrets are organised in one folder per service (e.g. /notion/NOTION_TOKEN). api_request finds a secret by name in any folder; pass path only if the same name exists in several.",
-  "Destructive api_request calls always need the user's approval, enforced by the server: DELETE requests, GraphQL delete/archive-style mutations, bodies that set archived/trashed/deleted to true, trash/delete-style URLs and Gmail send. The first call returns approval_required with a link; give the link to the user, wait until they say they approved it, then repeat the identical call with approval_id. An approval works once, for that exact action, for 15 minutes. Never try to work around it.",
+  "Destructive api_request calls always need the user's approval, enforced by the server: DELETE requests, GraphQL delete/archive-style mutations, bodies that set archived/trashed/deleted to true, trash/delete-style URLs and Gmail send, plus every write with a secret marked approval: \"writes\" (except its allow list). Prefer actions that need no approval (e.g. create a Gmail draft rather than send). The first call returns approval_required with a link; give the link to the user, wait until they say they approved it, then repeat the identical call with approval_id. An approval works once, for that exact action, for 15 minutes. Never try to work around it.",
   "For real CLIs that need credentials in their environment (aws, terraform), use issue_temp_token. It ALWAYS needs the user's approval, with a \"give token\" checkbox they must tick: the first call returns approval_required + a link; after they approve, repeat the identical call to receive a short-lived Infisical token and commands (infisical run). Treat that token as a secret: never print it, write it to a file, commit it or send it anywhere.",
   "For files too big to pass through the chat (or any file on disk), use get_upload_url: it needs no approval and returns a one-time upload URL (run the given curl with the file path) and a temporary download URL you can hand to other API calls. For the reverse (an API returns audio, an image or a file), call api_request with save_response=true to get a download URL instead of the bytes.",
   "Never ask the user to paste a token into the chat, and never try to read secret values back.",
@@ -75,12 +81,14 @@ export function createServer(env: Env) {
       secretPath: a.path ?? "/",
     });
     // Risky actions: the first call returns a link for the human; the repeat call carries approval_id.
-    const gate = async (tool: string, args: Record<string, unknown>, spec: ApprovalSpec) => {
+    // `spec` may be a function, so details that cost a call (e.g. reading a Gmail draft) are only built for the first call.
+    const gate = async (tool: string, args: Record<string, unknown>, specOrFn: ApprovalSpec | (() => Promise<ApprovalSpec>)) => {
       const approvalId = typeof args.approval_id === "string" ? args.approval_id : undefined;
       if (approvalId) {
         const c = await checkApproval(env, approvalId, tool, args);
         return c.ok ? null : fail(new Error(c.reason));
       }
+      const spec = typeof specOrFn === "function" ? await specOrFn() : specOrFn;
       const r = await requestApproval(env, tool, args, spec);
       return ok({
         approval_required: true, approval_id: r.id, approve_url: r.url, expires_in_minutes: r.expiresInMinutes,
@@ -103,7 +111,7 @@ export function createServer(env: Env) {
           "auth_type: bearer (default; Authorization: Bearer <secret>), header (header_name + optional header_prefix), basic (secret = 'user:pass', or username + secret as password), query (query_param), " +
           "file uploads: body_base64 (raw bytes) or multipart (form with files), up to 5 MB, or for bigger files first call get_upload_url, upload with curl, then pass the download URL as body_source or as a multipart file's source (up to 40 MB; the server reads it, nothing passes through the chat); " +
           "binary or large responses (generated audio, images, PDFs, exports): set save_response=true and the server stores a successful response in temporary storage and returns a download URL instead of the body (up to 40 MB, link valid 1 h, deleted after a day); " +
-          "oauth2_refresh (for Google, Microsoft and other OAuth APIs: the secret holds a refresh token; the server gets a short-lived access token and sends it as Bearer). Do not send your own Authorization header. Destructive requests always need the user's approval: method DELETE, GraphQL mutations whose names contain delete/destroy/remove/archive/purge/trash, bodies that set archived/trashed/deleted to true, URLs ending in /trash, /delete, /batchDelete or /emptyTrash, and Gmail send. The first call returns an approval link, and you repeat the call with approval_id once they approve.",
+          "oauth2_refresh (for Google, Microsoft and other OAuth APIs: the secret holds a refresh token; the server gets a short-lived access token and sends it as Bearer). Do not send your own Authorization header. Destructive requests always need the user's approval: method DELETE, GraphQL mutations whose names contain delete/destroy/remove/archive/purge/trash, bodies that set archived/trashed/deleted to true, URLs ending in /trash, /delete, /batchDelete or /emptyTrash, and Gmail send. A secret whose list_secrets entry has approval: \"writes\" needs approval for EVERY write (POST/PUT/PATCH/DELETE) except the ones in its allow list; reads never do. The first call returns an approval link, and you repeat the call with approval_id once they approve.",
         inputSchema: z.object({
           url: z.string().url().describe("Full https:// URL"),
           method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]).default("GET"),
@@ -136,16 +144,27 @@ export function createServer(env: Env) {
       },
       async (a) => {
         try {
-          const why = destructiveReason(a.method, a.body, a.url);
+          // Destructive patterns always need approval; with `approve: writes` in the secret's comment, so does every
+          // other write that no `allow:` line covers.
+          const destructive = destructiveReason(a.method, a.body, a.url);
+          const why = destructive ?? (await writeApprovalReason(env, a));
           if (why) {
-            const preview = typeof a.body === "string" ? a.body : a.body !== undefined ? JSON.stringify(a.body) : "";
-            const held = await gate("api_request", a, {
-              title: "Send a destructive request", risk: "danger",
-              rows: [
-                ["Request", `${a.method} ${a.url}`], ["Why flagged", why], ["Credential", `${a.secret} (${a.auth_type})`],
-                ...(a.query ? [["Query", JSON.stringify(a.query)] as [string, string]] : []),
-                ...(preview ? [["Body", `${preview.slice(0, 400)}${preview.length > 400 ? "..." : ""}`] as [string, string]] : []),
-              ],
+            const held = await gate("api_request", a, async () => {
+              let draft: Row[] | undefined;
+              const draftId = gmailDraftSendId(new URL(a.url), a.body);
+              if (draftId) {
+                // drafts/send only carries the draft id, so read the draft's recipients and subject to show them.
+                const unreadable: Row = ["Draft", `could not read draft ${draftId}; check it in Gmail before approving`, "warn"];
+                try {
+                  const r: any = await callApi(env, {
+                    secret: a.secret, auth_type: a.auth_type, environment: a.environment, path: a.path,
+                    url: `https://gmail.googleapis.com/gmail/v1/users/me/drafts/${draftId}`, query: { format: "metadata" },
+                  });
+                  draft = r.ok ? draftHeaderRows(JSON.parse(r.body)) : [unreadable];
+                } catch { draft = [unreadable]; }
+              }
+              const d = describeRequest(a, why, draft);
+              return { title: destructive ? `${d.title} (destructive)` : d.title, risk: destructive ? "danger" : "write", rows: d.rows };
             });
             if (held) return held;
           }
@@ -156,7 +175,7 @@ export function createServer(env: Env) {
 
     server.registerTool(
       "list_secrets",
-      { description: "List the credentials available to api_request: name, folder (path), the hosts each may be sent to (empty = never sent, e.g. IDs) and any note. Values are never returned. Searches all folders by default.", inputSchema: z.object({ ...loc, recursive: z.boolean().default(true) }) },
+      { description: "List the credentials available to api_request: name, folder (path), the hosts each may be sent to (empty = never sent, e.g. IDs), approval: \"writes\" if every write with it needs the user's approval (allow = the writes that don't) and any note. Values are never returned. Searches all folders by default.", inputSchema: z.object({ ...loc, recursive: z.boolean().default(true) }) },
       async (a) => {
         try {
           const b = base(a);
