@@ -1,12 +1,12 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
-import { infisical, redact } from "./infisical";
+import { infisical } from "./infisical";
 import { approvedHosts, callApi } from "./api-call";
 import { checkApproval, requestApproval, type ApprovalSpec } from "./approvals";
 import { agentConfigured, mintAgentToken, probeAccess, type AccessSummary } from "./temp-token";
-import { fullGuide, guide, usage, type Topic } from "./guide";
+import { AGENT_IDENTITY_SETUP, usage } from "./guide";
 import { destructiveReason } from "./destructive";
-import { buildComment, commentHosts } from "./hosts";
+import { stripHostsLines } from "./hosts";
 import { createUpload, SETUP as UPLOAD_SETUP, uploadsConfigured, type UploadEnv } from "./uploads";
 
 export interface Env extends UploadEnv {
@@ -31,7 +31,14 @@ export interface Env extends UploadEnv {
   AGENT_REQUIRE_READ_ONLY?: string; // "true" = refuse to issue a token if the agent identity can change or delete secrets
 }
 
-const ok = (data: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] });
+const ok = (data: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(data) }] }); // compact: indentation costs tokens
+
+// What the model needs about a secret: where it is and where it may be sent. Built field by field, so the value can never leak;
+// timestamps, version, type, empty tags and the raw comment (its hosts line repeats `hosts`) are left out to save tokens.
+const brief = (s: any) => {
+  const note = stripHostsLines(String(s?.secretComment ?? ""));
+  return { name: s?.secretKey, path: s?.secretPath, hosts: approvedHosts(s?.secretComment), ...(note ? { note } : {}) };
+};
 const fail = (e: unknown) => ({ isError: true, content: [{ type: "text" as const, text: String((e as Error).message ?? e) }] });
 
 const secretName = z.string().min(1).regex(/^[A-Za-z0-9_.\-]+$/, "letters, digits, _ . - only");
@@ -39,12 +46,12 @@ const secretName = z.string().min(1).regex(/^[A-Za-z0-9_.\-]+$/, "letters, digit
 const INSTRUCTIONS = [
   "Universal API: make authenticated calls to any HTTPS API or integration (GitHub, Jira, Notion, Stripe, Slack, AWS, ...) without ever seeing the credentials.",
   "Use api_request for the call itself: pass the secret NAME plus the URL, method and body; the server adds the token and returns the response with the token redacted.",
-  "Use list_secrets to see which credentials exist (names, approved hosts; never values) and add_secret to store a new one. A secret can only be sent to the hosts in its own comment (a 'hosts: ...' line, shown as approved_hosts). When you store a token with add_secret you MUST pass hosts, the API's hostnames, e.g. [\"api.linear.app\"] or [\"*.atlassian.net\"] (no scheme or path); look up the service's API host if you are unsure. Hosts are fixed when the secret is created and cannot be changed through this server, so get them right the first time; only the owner can change them later. If api_request says a host is not allowed, tell the user.",
-  "Secrets are organised in one folder per service (e.g. /notion/NOTION_TOKEN). api_request finds a secret by name in any folder; pass path only if the same name exists in several. When you add a token, put it in its own folder with path (e.g. /linear).",
-  "Destructive actions always need the user's approval, enforced by the server: delete_secret, update_secret with a new value or name, and api_request for DELETE requests, GraphQL delete/archive-style mutations and bodies that set archived/trashed/deleted to true. The first call returns approval_required with a link; give the link to the user, wait until they say they approved it, then repeat the identical call with approval_id. An approval works once, for that exact action, for 15 minutes. Never try to work around it.",
-  "For real CLIs that need credentials in their environment (aws, terraform), use issue_temp_token. It ALWAYS needs the user's approval, with a \"give token\" checkbox they must tick: the first call returns approval_required + a link; after they approve, repeat the identical call to receive a short-lived Infisical token and commands (infisical run). Treat that token as a secret: never print it, write it to a file, commit it or send it anywhere. access_guide explains setup (agent identity, Agent Proxy, AWS CLI) and needs no approval.",
+  "Use list_secrets to see which credentials exist (name, folder, hosts; never values). A secret can only be sent to its listed hosts. The owner adds and edits secrets in Infisical; this server cannot. If a credential is missing or api_request says a host is not allowed, tell the user.",
+  "Secrets are organised in one folder per service (e.g. /notion/NOTION_TOKEN). api_request finds a secret by name in any folder; pass path only if the same name exists in several.",
+  "Destructive api_request calls always need the user's approval, enforced by the server: DELETE requests, GraphQL delete/archive-style mutations and bodies that set archived/trashed/deleted to true. The first call returns approval_required with a link; give the link to the user, wait until they say they approved it, then repeat the identical call with approval_id. An approval works once, for that exact action, for 15 minutes. Never try to work around it.",
+  "For real CLIs that need credentials in their environment (aws, terraform), use issue_temp_token. It ALWAYS needs the user's approval, with a \"give token\" checkbox they must tick: the first call returns approval_required + a link; after they approve, repeat the identical call to receive a short-lived Infisical token and commands (infisical run). Treat that token as a secret: never print it, write it to a file, commit it or send it anywhere.",
   "For files too big to pass through the chat (or any file on disk), use get_upload_url: it needs no approval and returns a one-time upload URL (run the given curl with the file path) and a temporary download URL you can hand to other API calls. For the reverse (an API returns audio, an image or a file), call api_request with save_response=true to get a download URL instead of the bytes.",
-  "Never ask the user to paste a token into the chat if it can be stored with add_secret, and never try to read secret values back.",
+  "Never ask the user to paste a token into the chat, and never try to read secret values back.",
 ].join("\n");
 
 const MAX_TOKEN_SECONDS_DEFAULT = 3600;
@@ -92,7 +99,7 @@ export function createServer(env: Env) {
         description:
           "Make an authenticated HTTPS request to ANY API or integration (GitHub, Jira, Notion, Stripe, Slack, AWS, ...) using a credential stored in this server, without ever seeing it. Use this whenever you need to call a third-party API on the user's behalf. " +
           "Pass the secret NAME (see list_secrets); the server reads the token, adds the auth, calls the API and returns the response with the token redacted. " +
-          "A secret can only be sent to the hosts in its own comment (the hosts given to add_secret; see approved_hosts in list_secrets), otherwise the call is refused and the error lists the approved hosts. Redirects are not followed. The server waits up to 3 minutes for the API to respond. " +
+          "A secret can only be sent to the hosts in its own comment (see hosts in list_secrets), otherwise the call is refused and the error lists the approved hosts. Redirects are not followed. The server waits up to 3 minutes for the API to respond. " +
           "auth_type: bearer (default; Authorization: Bearer <secret>), header (header_name + optional header_prefix), basic (secret = 'user:pass', or username + secret as password), query (query_param), " +
           "file uploads: body_base64 (raw bytes) or multipart (form with files), up to 5 MB, or for bigger files first call get_upload_url, upload with curl, then pass the download URL as body_source or as a multipart file's source (up to 40 MB; the server reads it, nothing passes through the chat); " +
           "binary or large responses (generated audio, images, PDFs, exports): set save_response=true and the server stores a successful response in temporary storage and returns a download URL instead of the body (up to 40 MB, link valid 1 h, deleted after a day); " +
@@ -152,111 +159,14 @@ export function createServer(env: Env) {
       },
     );
 
-    server.registerTool("list_environments", { description: "List environments of the configured Infisical project.", inputSchema: z.object({}) }, async () => {
-      try { return ok(await infisical.listEnvironments(env, env.INFISICAL_PROJECT_ID)); } catch (e) { return fail(e); }
-    });
-
-    server.registerTool(
-      "list_folders",
-      { description: "List folders under a path in an environment.", inputSchema: z.object({ ...loc, recursive: z.boolean().default(false) }) },
-      async (a) => {
-        try {
-          const b = base(a);
-          const r = await infisical.listFolders(env, { projectId: b.projectId, environment: b.environment, path: b.secretPath, recursive: a.recursive });
-          return ok((r.folders ?? []).map((f: any) => ({ name: f.name, path: f.relativePath ?? f.name })));
-        } catch (e) { return fail(e); }
-      },
-    );
-
     server.registerTool(
       "list_secrets",
-      { description: "List the credentials available to api_request: names, folders, comments and the hosts each may be sent to. Values are never returned. Searches all folders by default.", inputSchema: z.object({ ...loc, recursive: z.boolean().default(true) }) },
+      { description: "List the credentials available to api_request: name, folder (path), the hosts each may be sent to (empty = never sent, e.g. IDs) and any note. Values are never returned. Searches all folders by default.", inputSchema: z.object({ ...loc, recursive: z.boolean().default(true) }) },
       async (a) => {
         try {
           const b = base(a);
           const r = await infisical.listSecrets(env, { ...b, recursive: a.recursive });
-          return ok((r.secrets ?? []).map((x: any) => ({ ...redact(x), approved_hosts: approvedHosts(x.secretComment) })));
-        } catch (e) { return fail(e); }
-      },
-    );
-
-    server.registerTool(
-      "get_secret",
-      { description: "Get a secret's metadata. The raw value is never returned; to use a secret in an API request, call api_request with its name.", inputSchema: z.object({ name: secretName, ...loc }) },
-      async (a) => {
-        try {
-          const b = base(a);
-          const r = await infisical.getSecret(env, a.name, b);
-          return ok({ ...redact(r.secret), approved_hosts: approvedHosts(r.secret?.secretComment) });
-        } catch (e) { return fail(e); }
-      },
-    );
-
-    server.registerTool(
-      "add_secret",
-      {
-        description:
-          "Store a new credential (e.g. a Jira or Stripe token) so api_request can use it. The value is written to Infisical and not echoed back. " +
-          "hosts = the only hostnames api_request may send this secret to, e.g. [\"api.linear.app\"] or [\"*.atlassian.net\"] (no scheme, path or port). Required for any token you want to use with api_request. They are saved in the secret's comment as 'hosts: ...' and cannot be changed through this server later, so double-check them. " +
-          "Omit hosts only for values that are never sent anywhere (IDs, config). comment = a free-text note.",
-        inputSchema: z.object({ name: secretName, value: z.string().min(1), hosts: z.array(z.string()).max(10).optional(), comment: z.string().optional(), ...loc }),
-      },
-      async (a) => {
-        try {
-          const b = base(a);
-          const note = buildComment(a.hosts, a.comment); // validates hosts; drops any 'hosts:' line typed into the note
-          const r = await infisical.createSecret(env, a.name, { ...b, secretValue: a.value, secretComment: note });
-          const hosts = approvedHosts(note);
-          return ok({
-            created: true, ...redact(r.secret), approved_hosts: hosts,
-            ...(hosts.length ? {} : { note: "No hosts are approved for this secret, so api_request will refuse to send it anywhere. Fine for IDs; for a token, delete it and add it again with hosts, or ask the owner to set the comment in Infisical." }),
-          });
-        } catch (e) { return fail(e); }
-      },
-    );
-
-    server.registerTool(
-      "update_secret",
-      { description: "Update a secret's value, comment (free-text note), or name. The value is not echoed back. The approved hosts (the 'hosts:' line in the comment) are kept as they are and cannot be changed here. Changing the value or the name overwrites the secret and needs the user's approval: the first call returns an approval link, and you repeat the call with approval_id once they approve. Changing only the comment needs no approval.", inputSchema: z.object({
-        name: secretName, value: z.string().min(1).optional(), comment: z.string().optional(),
-        new_name: secretName.optional(), ...loc, ...approvalField,
-      }) },
-      async (a) => {
-        try {
-          if (a.value === undefined && a.comment === undefined && a.new_name === undefined) throw new Error("Nothing to update");
-          const b = base(a);
-          if (a.value !== undefined || a.new_name !== undefined) {
-            const held = await gate("update_secret", a, {
-              title: a.value !== undefined ? "Overwrite a secret" : "Rename a secret", risk: "danger",
-              rows: [
-                ["Secret", a.name], ["Environment", b.environment], ["Folder", b.secretPath],
-                ...(a.value !== undefined ? [["Change", "Replace the value. The old one cannot be recovered through this server."] as [string, string]] : []),
-                ...(a.new_name !== undefined ? [["Rename to", a.new_name] as [string, string]] : []),
-              ],
-            });
-            if (held) return held;
-          }
-          // Always send the comment back: Infisical clears it when omitted, which would also drop the approved hosts.
-          const existing = (await infisical.getSecret(env, a.name, b)).secret?.secretComment ?? "";
-          const body: Record<string, unknown> = { ...b, secretComment: a.comment !== undefined ? buildComment(commentHosts(existing), a.comment) : existing };
-          if (a.value !== undefined) body.secretValue = a.value;
-          if (a.new_name !== undefined) body.newSecretName = a.new_name;
-          const r = await infisical.updateSecret(env, a.name, body);
-          return ok({ updated: true, ...redact(r.secret), approved_hosts: approvedHosts(r.secret?.secretComment) });
-        } catch (e) { return fail(e); }
-      },
-    );
-
-    server.registerTool(
-      "delete_secret",
-      { description: "Permanently delete a secret. Always needs the user's approval: the first call returns an approval link for the user, and you repeat the call with approval_id once they approve.", inputSchema: z.object({ name: secretName, confirm: z.literal(true).describe("Must be true"), ...loc, ...approvalField }) },
-      async (a) => {
-        try {
-          const b = base(a);
-          const held = await gate("delete_secret", a, { title: "Delete a secret", risk: "danger", rows: [["Secret", a.name], ["Environment", b.environment], ["Folder", b.secretPath], ["Effect", "Permanent. It cannot be undone through this server."]] });
-          if (held) return held;
-          await infisical.deleteSecret(env, a.name, b);
-          return ok({ deleted: a.name, environment: b.environment, path: b.secretPath });
+          return ok({ environment: b.environment, secrets: (r.secrets ?? []).map(brief) });
         } catch (e) { return fail(e); }
       },
     );
@@ -280,7 +190,7 @@ export function createServer(env: Env) {
             return ok({
               configured: false,
               message: "No agent identity is set up, so no token can be issued. The owner needs to create one first; the steps are below.",
-              how_to_set_up: guide("agent_identity"),
+              how_to_set_up: AGENT_IDENTITY_SETUP,
             });
           }
           const environment = a.environment ?? env.DEFAULT_ENVIRONMENT;
@@ -358,15 +268,6 @@ export function createServer(env: Env) {
           return ok(await createUpload(env, a));
         } catch (e) { return fail(e); }
       },
-    );
-
-    server.registerTool(
-      "access_guide",
-      {
-        description: "Explains how to set up and use temporary access for CLIs: the limited agent identity, running the Infisical Agent Proxy server, and running the AWS CLI. Returns text only (no secrets); needs no approval.",
-        inputSchema: z.object({ topic: z.enum(["overview", "agent_identity", "proxy", "aws", "all"]).default("overview") }),
-      },
-      async (a) => ({ content: [{ type: "text" as const, text: a.topic === "all" ? fullGuide() : guide(a.topic as Topic) }] }),
     );
   }
   return server;

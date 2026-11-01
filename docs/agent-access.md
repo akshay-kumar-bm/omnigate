@@ -1,6 +1,6 @@
 # Temporary access for CLIs (AWS CLI, terraform) and the Agent Proxy
 
-Most API calls go through `api_request`, where the server adds the credential and the assistant never sees it. Some tools cannot work that way because they need credentials in their own environment (the AWS CLI, terraform). For those there is `issue_temp_token`: it gives the assistant a **short-lived Infisical token** so it can run `infisical run -- <command>`. This file is also returned by the `access_guide` tool.
+Most API calls go through `api_request`, where the server adds the credential and the assistant never sees it. Some tools cannot work that way because they need credentials in their own environment (the AWS CLI, terraform). For those there is `issue_temp_token`: it gives the assistant a **short-lived Infisical token** so it can run `infisical run -- <command>`.
 
 ## What you get, and the rules
 - **Always approved by a person.** Every `issue_temp_token` call returns an approval link first. The approver signs in with Google, sees the purpose, the project, the folder and the token's lifetime, and must **tick a box** ("Yes, give the assistant a temporary Infisical token...") before **Give token** works. The box is enforced on the server. Each approval is for that exact request, works once and expires after 15 minutes.

@@ -1,5 +1,5 @@
 // Thin Infisical REST client (Universal Auth machine identity).
-// Endpoints: v4 secrets (list/get/create/update/delete), v2 folders, project lookup for environments.
+// Endpoints: v4 secrets (list, and read one value server-side for api_request).
 export interface InfisicalEnv {
   INFISICAL_HOST: string;
   INFISICAL_CLIENT_ID: string;
@@ -39,32 +39,10 @@ async function call(env: InfisicalEnv, method: string, path: string, opts: { que
   return data;
 }
 
-// Strip anything that could carry the real value.
-export function redact(s: any) {
-  if (!s) return s;
-  const { secretValue, ...rest } = s;
-  return {
-    name: rest.secretKey,
-    environment: rest.environment,
-    path: rest.secretPath,
-    version: rest.version,
-    type: rest.type,
-    comment: rest.secretComment,
-    tags: (rest.tags ?? []).map((t: any) => t.slug),
-    createdAt: rest.createdAt,
-    updatedAt: rest.updatedAt,
-    valueHidden: true,
-  };
-}
-
 export const infisical = {
   listSecrets: (env: InfisicalEnv, q: { projectId: string; environment: string; secretPath: string; recursive: boolean }) =>
     call(env, "GET", "/api/v4/secrets", {
       query: { ...q, recursive: String(q.recursive), viewSecretValue: "false", expandSecretReferences: "false", includeImports: "false" },
-    }),
-  getSecret: (env: InfisicalEnv, name: string, q: { projectId: string; environment: string; secretPath: string }) =>
-    call(env, "GET", `/api/v4/secrets/${encodeURIComponent(name)}`, {
-      query: { ...q, type: "shared", viewSecretValue: "false", expandSecretReferences: "false", includeImports: "false" },
     }),
   // Server-side use only (api_request). The value must never be returned to the MCP client.
   getSecretValue: async (env: InfisicalEnv, name: string, q: { projectId: string; environment: string; secretPath: string }): Promise<{ value: string; comment: string }> => {
@@ -82,24 +60,5 @@ export const infisical = {
       query: { ...q, secretPath: "/", recursive: "true", viewSecretValue: "false", expandSecretReferences: "false", includeImports: "false" },
     });
     return (r.secrets ?? []).filter((x: any) => x.secretKey === name).map((x: any) => String(x.secretPath ?? "/"));
-  },
-  createSecret: (env: InfisicalEnv, name: string, body: Record<string, unknown>) =>
-    call(env, "POST", `/api/v4/secrets/${encodeURIComponent(name)}`, { body: { type: "shared", ...body } }),
-  updateSecret: (env: InfisicalEnv, name: string, body: Record<string, unknown>) =>
-    call(env, "PATCH", `/api/v4/secrets/${encodeURIComponent(name)}`, { body: { type: "shared", ...body } }),
-  deleteSecret: (env: InfisicalEnv, name: string, body: Record<string, unknown>) =>
-    call(env, "DELETE", `/api/v4/secrets/${encodeURIComponent(name)}`, { body: { type: "shared", ...body } }),
-  listFolders: (env: InfisicalEnv, q: { projectId: string; environment: string; path: string; recursive: boolean }) =>
-    call(env, "GET", "/api/v2/folders", { query: { ...q, recursive: String(q.recursive) } }),
-  async listEnvironments(env: InfisicalEnv, projectId: string) {
-    // Project object carries its environments; try the current path then the legacy one.
-    for (const p of [`/api/v1/projects/${projectId}`, `/api/v1/workspace/${projectId}`]) {
-      try {
-        const j = await call(env, "GET", p);
-        const envs = j.environments ?? j.project?.environments ?? j.workspace?.environments;
-        if (envs) return envs.map((e: any) => ({ name: e.name, slug: e.slug }));
-      } catch { /* try next */ }
-    }
-    throw new Error("Could not read environments from Infisical project");
   },
 };

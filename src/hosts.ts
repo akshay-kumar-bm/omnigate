@@ -1,7 +1,6 @@
 // Approved hosts live in each secret's own comment, as a line `hosts: api.example.com, *.example.com`.
-// add_secret writes it from its `hosts` argument; update_secret keeps it unchanged and strips any `hosts:` line
-// from new comment text, so hosts are fixed when the secret is created and the model cannot widen them later.
-// The owner can edit the comment in the Infisical dashboard. There is no other source of approvals:
+// Only the owner writes it, in the Infisical dashboard; this server has no tool that creates or edits secrets,
+// so the model cannot widen them. There is no other source of approvals:
 // a secret without a valid `hosts:` line is never sent anywhere.
 
 // Domains where anyone can register a subdomain and read the requests it receives, so a wildcard on them
@@ -42,8 +41,3 @@ export function stripHostsLines(comment: string): string {
   return comment.replace(HOSTS_LINES, "").replace(/\n{2,}/g, "\n").trim();
 }
 
-// Builds a comment from validated hosts plus free-text note (any `hosts:` line in the note is dropped).
-export function buildComment(hosts: string[] | undefined, note: string | undefined): string {
-  const valid = [...new Set((hosts ?? []).map(validateHostPattern))];
-  return [valid.length ? `hosts: ${valid.join(", ")}` : "", stripHostsLines(note ?? "")].filter(Boolean).join("\n");
-}
