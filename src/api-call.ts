@@ -3,7 +3,6 @@
 // and returns only the response (with the secret redacted). A secret can only be sent to the hosts in its own
 // comment (`hosts: ...`), which are fixed when it is created (see hosts.ts), so a prompt-injected client
 // cannot point an existing token at an attacker's server.
-import { AwsClient } from "aws4fetch";
 import { commentHosts } from "./hosts";
 import { infisical } from "./infisical";
 import { extensionFor, fetchStored, MAX_STORED_BYTES, saveStored, uploadsConfigured, type UploadEnv } from "./uploads";
@@ -25,17 +24,12 @@ export interface ApiCallArgs {
   body_base64?: string; // raw binary request body (e.g. PUT an object to S3)
   body_source?: string; // a file stored by get_upload_url (its download URL or key): the Worker reads it and sends it as the raw body
   multipart?: { fields?: Record<string, string>; files: { field?: string; filename?: string; content_type?: string; data_base64?: string; source?: string }[] };
-  auth_type?: "bearer" | "header" | "basic" | "query" | "aws_sigv4";
+  auth_type?: "bearer" | "header" | "basic" | "query" | "oauth2_refresh";
   secret?: string;
   header_name?: string;
   header_prefix?: string;
   query_param?: string;
   username?: string;
-  aws_service?: string;
-  aws_region?: string;
-  aws_access_key_secret?: string;
-  aws_secret_key_secret?: string;
-  aws_session_token_secret?: string;
   save_response?: boolean; // store a 2xx response body in R2 and return a download URL instead of the body (e.g. generated audio)
   environment?: string;
   path?: string;
@@ -108,6 +102,53 @@ function decodeBase64(b64: string): Uint8Array {
   return out;
 }
 
+// oauth2_refresh: the secret is JSON {client_id, client_secret?, refresh_token, token_url, scope?} written by the owner.
+// The Worker trades the refresh token for a short-lived access token (cached per isolate until a minute before it
+// expires) and sends that as Bearer. token_url comes only from the secret and its host must also be in the secret's
+// hosts line, so the refresh token can only go where the owner allowed. Providers that invalidate the old refresh
+// token on every refresh are not supported: this server cannot write the new one back to Infisical.
+const tokenCache = new Map<string, { token: string; expires: number }>();
+
+async function oauthAccessToken(name: string, value: string, approved: string[], used: string[]): Promise<string> {
+  let cfg: Record<string, unknown>;
+  try { cfg = JSON.parse(value); } catch { cfg = {}; }
+  const str = (k: string) => (typeof cfg[k] === "string" && cfg[k] ? (cfg[k] as string) : undefined);
+  const refreshToken = str("refresh_token"), tokenUrl = str("token_url"), clientId = str("client_id"), clientSecret = str("client_secret");
+  if (!refreshToken || !tokenUrl || !clientId) {
+    throw new Error(`Secret ${name} must be JSON with client_id, refresh_token and token_url (client_secret and scope optional) for auth_type=oauth2_refresh`);
+  }
+  for (const v of [refreshToken, clientSecret]) if (v) used.push(v);
+  const tu = new URL(tokenUrl);
+  if (tu.protocol !== "https:" || tu.username || tu.password || (tu.port && tu.port !== "443")) throw new Error(`token_url in ${name} must be a plain https:// URL`);
+  if (!hostAllowed(tu.hostname, approved)) throw new Error(`token_url host ${tu.hostname} is not in the hosts line of ${name}; the owner must add it in Infisical`);
+
+  const key = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value))), (b) => b.toString(16).padStart(2, "0")).join("");
+  const hit = tokenCache.get(key);
+  if (hit && hit.expires > Date.now()) { used.push(hit.token); return hit.token; }
+
+  const form = new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: clientId });
+  if (clientSecret) form.set("client_secret", clientSecret);
+  if (str("scope")) form.set("scope", str("scope")!);
+  const res = await fetch(tu.toString(), {
+    method: "POST", redirect: "manual", signal: AbortSignal.timeout(30_000),
+    headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" }, body: form,
+  });
+  const text = await res.text();
+  const data = (() => { try { return JSON.parse(text) as Record<string, unknown>; } catch { return {}; } })();
+  if (typeof data.access_token === "string" && data.access_token) used.push(data.access_token);
+  if (!res.ok || typeof data.access_token !== "string" || !data.access_token) {
+    const why = [data.error, data.error_description].filter((x) => typeof x === "string").join(": ") || `HTTP ${res.status}`;
+    const hint = data.error === "invalid_grant"
+      ? " The refresh token expired or was revoked; the owner must get a new one and update the secret in Infisical (Google expires them after 7 days while the OAuth app is in Testing mode)."
+      : "";
+    throw new Error(`Could not get an access token for ${name} from ${tu.hostname}: ${used.reduce((t, u) => t.split(u).join("[REDACTED]"), why).slice(0, 300)}.${hint}`);
+  }
+  const ttl = typeof data.expires_in === "number" ? data.expires_in : Number(data.expires_in) || 3600;
+  if (tokenCache.size > 100) tokenCache.clear();
+  tokenCache.set(key, { token: data.access_token, expires: Date.now() + Math.max(0, ttl - 60) * 1000 });
+  return data.access_token;
+}
+
 export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown> {
   const url = new URL(a.url);
   if (url.protocol !== "https:") throw new Error("Only https:// URLs are allowed");
@@ -138,7 +179,7 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
       );
     }
     used.push(secret.value);
-    return secret.value;
+    return { value: secret.value, approved };
   };
 
   const headers = new Headers(a.headers ?? {});
@@ -173,7 +214,6 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
     uploadBytes = f.bytes.length;
     if (!headers.has("content-type")) headers.set("content-type", f.contentType);
   } else if (a.multipart) {
-    if (a.auth_type === "aws_sigv4") throw new Error("multipart is not supported with aws_sigv4; use body_base64");
     const fd = new FormData();
     for (const [k, v] of Object.entries(a.multipart.fields ?? {})) fd.append(k, v);
     for (const f of a.multipart.files) {
@@ -203,36 +243,25 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
     if (headers.has(name)) throw new Error(`Do not send your own ${name} header; it is set from the secret`);
   };
 
-  let req: Request;
-  if (authType === "aws_sigv4") {
-    const accessKey = await read(a.aws_access_key_secret ?? "AWS_ACCESS_KEY_ID");
-    const secretKey = await read(a.aws_secret_key_secret ?? "AWS_SECRET_ACCESS_KEY");
-    const tokenName = a.aws_session_token_secret ?? "AWS_SESSION_TOKEN";
-    let sessionToken: string | undefined;
-    try { sessionToken = await read(tokenName); } catch { /* optional; also skipped if not approved for this host */ }
-    const client = new AwsClient({
-      accessKeyId: accessKey, secretAccessKey: secretKey, sessionToken,
-      service: need(a.aws_service, "aws_service"), region: need(a.aws_region, "aws_region"),
-    });
-    req = await client.sign(url.toString(), { method, headers, body: body as BodyInit | undefined });
-  } else {
-    const value = await read(need(a.secret, "secret"));
-    if (authType === "bearer") { injected("authorization"); headers.set("authorization", `Bearer ${value}`); }
-    else if (authType === "header") {
-      const name = need(a.header_name, "header_name");
-      injected(name.toLowerCase());
-      headers.set(name, a.header_prefix ? `${a.header_prefix} ${value}` : value);
-    } else if (authType === "basic") {
-      injected("authorization");
-      const cred = a.username !== undefined ? `${a.username}:${value}` : value;
-      if (!cred.includes(":")) throw new Error("basic auth needs 'user:password' in the secret, or pass username with the password as the secret");
-      headers.set("authorization", `Basic ${btoa(cred)}`);
-      used.push(btoa(cred));
-    } else if (authType === "query") {
-      url.searchParams.set(need(a.query_param, "query_param"), value);
-    } else throw new Error(`Unknown auth_type ${authType}`);
-    req = new Request(url.toString(), { method, headers, body: method === "GET" || method === "HEAD" ? undefined : (body as BodyInit | undefined) });
-  }
+  const { value, approved } = await read(need(a.secret, "secret"));
+  if (authType === "bearer") { injected("authorization"); headers.set("authorization", `Bearer ${value}`); }
+  else if (authType === "oauth2_refresh") {
+    injected("authorization");
+    headers.set("authorization", `Bearer ${await oauthAccessToken(a.secret!, value, approved, used)}`);
+  } else if (authType === "header") {
+    const name = need(a.header_name, "header_name");
+    injected(name.toLowerCase());
+    headers.set(name, a.header_prefix ? `${a.header_prefix} ${value}` : value);
+  } else if (authType === "basic") {
+    injected("authorization");
+    const cred = a.username !== undefined ? `${a.username}:${value}` : value;
+    if (!cred.includes(":")) throw new Error("basic auth needs 'user:password' in the secret, or pass username with the password as the secret");
+    headers.set("authorization", `Basic ${btoa(cred)}`);
+    used.push(btoa(cred));
+  } else if (authType === "query") {
+    url.searchParams.set(need(a.query_param, "query_param"), value);
+  } else throw new Error(`Unknown auth_type ${authType}`);
+  const req = new Request(url.toString(), { method, headers, body: method === "GET" || method === "HEAD" ? undefined : (body as BodyInit | undefined) });
 
   // Never follow redirects: the next hop could be a host the secret is not bound to.
   const res = await fetch(req, { redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });

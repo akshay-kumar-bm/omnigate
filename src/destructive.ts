@@ -1,9 +1,12 @@
 // Best-effort detection of destructive api_request calls that are not an HTTP DELETE, so they get human approval too.
 // It cannot be perfect: it only recognises (1) GraphQL documents whose field names say delete/destroy/remove/archive/
 // purge/trash (field names are literal text in the document, so aliases cannot hide them) and (2) JSON bodies that set
-// archived/trashed/deleted/in_trash to true (how Notion, GitHub and others archive). Anything else is treated as normal.
+// archived/trashed/deleted/in_trash to true (how Notion, GitHub and others archive), (3) REST URLs whose last path
+// segment is a trash/delete action (Gmail POST .../messages/{id}/trash, .../batchDelete, Google ...:batchDelete) and
+// (4) Gmail send, which cannot be undone. Anything else is treated as normal.
 
 const GRAPHQL_DESTRUCTIVE = /(delete|destroy|remove|archive|purge|trash)/i;
+const PATH_DESTRUCTIVE = /[/:](trash|delete|batchdelete|emptytrash)$/i;
 const FLAG_KEYS = new Set(["archived", "in_trash", "trashed", "deleted", "is_archived", "is_deleted"]);
 
 // Drop string literals and comments so text such as {title: "Delete the cache"} is not mistaken for an operation.
@@ -31,9 +34,19 @@ function graphqlText(body: unknown): string | null {
 const safeJson = (s: string): unknown => { try { return JSON.parse(s); } catch { return undefined; } };
 
 // Why this call needs approval, or null if it does not look destructive.
-export function destructiveReason(method: string, body: unknown): string | null {
+export function destructiveReason(method: string, body: unknown, url?: string): string | null {
   if (method === "DELETE") return "HTTP DELETE request";
-  if (method === "GET" || method === "HEAD" || body === undefined || body === null) return null;
+  if (method === "GET" || method === "HEAD") return null;
+  if (url) {
+    let path = "", host = "";
+    try { const u = new URL(url); path = u.pathname; host = u.hostname.toLowerCase(); } catch { /* callApi rejects it */ }
+    try { path = decodeURIComponent(path); } catch { /* keep the raw path; an encoded name is still checked below */ }
+    path = path.replace(/\/+$/, "");
+    const m = path.match(PATH_DESTRUCTIVE);
+    if (m) return `URL ends in a ${m[1]} action`;
+    if ((host === "gmail.googleapis.com" || path.includes("/gmail/")) && /\/send$/i.test(path)) return "sends an email (Gmail send)";
+  }
+  if (body === undefined || body === null) return null;
   const gql = graphqlText(body);
   if (gql !== null) {
     const doc = stripGraphqlNoise(gql);

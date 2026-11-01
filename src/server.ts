@@ -44,11 +44,11 @@ const fail = (e: unknown) => ({ isError: true, content: [{ type: "text" as const
 const secretName = z.string().min(1).regex(/^[A-Za-z0-9_.\-]+$/, "letters, digits, _ . - only");
 
 const INSTRUCTIONS = [
-  "Universal API: make authenticated calls to any HTTPS API or integration (GitHub, Jira, Notion, Stripe, Slack, AWS, ...) without ever seeing the credentials.",
+  "Universal API: make authenticated calls to any HTTPS API or integration (GitHub, Jira, Notion, Stripe, Slack, Google, ...) without ever seeing the credentials.",
   "Use api_request for the call itself: pass the secret NAME plus the URL, method and body; the server adds the token and returns the response with the token redacted.",
   "Use list_secrets to see which credentials exist (name, folder, hosts; never values). A secret can only be sent to its listed hosts. The owner adds and edits secrets in Infisical; this server cannot. If a credential is missing or api_request says a host is not allowed, tell the user.",
   "Secrets are organised in one folder per service (e.g. /notion/NOTION_TOKEN). api_request finds a secret by name in any folder; pass path only if the same name exists in several.",
-  "Destructive api_request calls always need the user's approval, enforced by the server: DELETE requests, GraphQL delete/archive-style mutations and bodies that set archived/trashed/deleted to true. The first call returns approval_required with a link; give the link to the user, wait until they say they approved it, then repeat the identical call with approval_id. An approval works once, for that exact action, for 15 minutes. Never try to work around it.",
+  "Destructive api_request calls always need the user's approval, enforced by the server: DELETE requests, GraphQL delete/archive-style mutations, bodies that set archived/trashed/deleted to true, trash/delete-style URLs and Gmail send. The first call returns approval_required with a link; give the link to the user, wait until they say they approved it, then repeat the identical call with approval_id. An approval works once, for that exact action, for 15 minutes. Never try to work around it.",
   "For real CLIs that need credentials in their environment (aws, terraform), use issue_temp_token. It ALWAYS needs the user's approval, with a \"give token\" checkbox they must tick: the first call returns approval_required + a link; after they approve, repeat the identical call to receive a short-lived Infisical token and commands (infisical run). Treat that token as a secret: never print it, write it to a file, commit it or send it anywhere.",
   "For files too big to pass through the chat (or any file on disk), use get_upload_url: it needs no approval and returns a one-time upload URL (run the given curl with the file path) and a temporary download URL you can hand to other API calls. For the reverse (an API returns audio, an image or a file), call api_request with save_response=true to get a download URL instead of the bytes.",
   "Never ask the user to paste a token into the chat, and never try to read secret values back.",
@@ -64,7 +64,7 @@ export function createServer(env: Env) {
       name: "universal-api",
       title: "Universal API",
       version: "0.2.0",
-      description: "Call any HTTPS API or integration (GitHub, Jira, Notion, Stripe, Slack, AWS, ...) with credentials kept in a vault. You never see the tokens.",
+      description: "Call any HTTPS API or integration (GitHub, Jira, Notion, Stripe, Slack, Google, ...) with credentials kept in a vault. You never see the tokens.",
     },
     { instructions: INSTRUCTIONS },
   );
@@ -97,13 +97,13 @@ export function createServer(env: Env) {
       "api_request",
       {
         description:
-          "Make an authenticated HTTPS request to ANY API or integration (GitHub, Jira, Notion, Stripe, Slack, AWS, ...) using a credential stored in this server, without ever seeing it. Use this whenever you need to call a third-party API on the user's behalf. " +
+          "Make an authenticated HTTPS request to ANY API or integration (GitHub, Jira, Notion, Stripe, Slack, Google, ...) using a credential stored in this server, without ever seeing it. Use this whenever you need to call a third-party API on the user's behalf. " +
           "Pass the secret NAME (see list_secrets); the server reads the token, adds the auth, calls the API and returns the response with the token redacted. " +
           "A secret can only be sent to the hosts in its own comment (see hosts in list_secrets), otherwise the call is refused and the error lists the approved hosts. Redirects are not followed. The server waits up to 3 minutes for the API to respond. " +
           "auth_type: bearer (default; Authorization: Bearer <secret>), header (header_name + optional header_prefix), basic (secret = 'user:pass', or username + secret as password), query (query_param), " +
           "file uploads: body_base64 (raw bytes) or multipart (form with files), up to 5 MB, or for bigger files first call get_upload_url, upload with curl, then pass the download URL as body_source or as a multipart file's source (up to 40 MB; the server reads it, nothing passes through the chat); " +
           "binary or large responses (generated audio, images, PDFs, exports): set save_response=true and the server stores a successful response in temporary storage and returns a download URL instead of the body (up to 40 MB, link valid 1 h, deleted after a day); " +
-          "aws_sigv4 (signs with secrets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / optional AWS_SESSION_TOKEN; needs aws_service and aws_region). Do not send your own Authorization header. Destructive requests always need the user's approval: method DELETE, GraphQL mutations whose names contain delete/destroy/remove/archive/purge/trash, and bodies that set archived/trashed/deleted to true. The first call returns an approval link, and you repeat the call with approval_id once they approve.",
+          "oauth2_refresh (for Google, Microsoft and other OAuth APIs: the secret holds a refresh token; the server gets a short-lived access token and sends it as Bearer). Do not send your own Authorization header. Destructive requests always need the user's approval: method DELETE, GraphQL mutations whose names contain delete/destroy/remove/archive/purge/trash, bodies that set archived/trashed/deleted to true, URLs ending in /trash, /delete, /batchDelete or /emptyTrash, and Gmail send. The first call returns an approval link, and you repeat the call with approval_id once they approve.",
         inputSchema: z.object({
           url: z.string().url().describe("Full https:// URL"),
           method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]).default("GET"),
@@ -121,18 +121,13 @@ export function createServer(env: Env) {
               data_base64: z.string().optional().describe("File bytes as base64 (max 5 MB). Use this OR source."),
               source: z.string().optional().describe("Download URL (or key) of a file stored with get_upload_url; the server reads it itself (max 40 MB total). Use this OR data_base64."),
             })).min(1),
-          }).optional().describe("multipart/form-data upload (max 5 MB total with data_base64, 40 MB with source), e.g. Notion /v1/file_uploads/{id}/send. Use instead of body. Not for aws_sigv4."),
-          auth_type: z.enum(["bearer", "header", "basic", "query", "aws_sigv4"]).default("bearer"),
-          secret: secretName.optional().describe("Name of the secret holding the token / API key (not needed for aws_sigv4)"),
+          }).optional().describe("multipart/form-data upload (max 5 MB total with data_base64, 40 MB with source), e.g. Notion /v1/file_uploads/{id}/send. Use instead of body."),
+          auth_type: z.enum(["bearer", "header", "basic", "query", "oauth2_refresh"]).default("bearer"),
+          secret: secretName.describe("Name of the secret holding the token / API key (for oauth2_refresh: the OAuth secret, e.g. GOOGLE_OAUTH)"),
           header_name: z.string().optional(),
           header_prefix: z.string().optional(),
           query_param: z.string().optional(),
           username: z.string().optional(),
-          aws_service: z.string().optional().describe("e.g. s3, sts, ec2"),
-          aws_region: z.string().optional().describe("e.g. us-east-1"),
-          aws_access_key_secret: secretName.optional().describe("default AWS_ACCESS_KEY_ID"),
-          aws_secret_key_secret: secretName.optional().describe("default AWS_SECRET_ACCESS_KEY"),
-          aws_session_token_secret: secretName.optional().describe("default AWS_SESSION_TOKEN"),
           save_response: z.boolean().optional().describe("Store a successful (2xx) response body in temporary storage and return saved.download_url instead of the body. Use for binary output such as text-to-speech audio, images or file downloads. Error responses are returned as text as usual."),
           ...loc,
           ...approvalField,
@@ -141,13 +136,13 @@ export function createServer(env: Env) {
       },
       async (a) => {
         try {
-          const why = destructiveReason(a.method, a.body);
+          const why = destructiveReason(a.method, a.body, a.url);
           if (why) {
             const preview = typeof a.body === "string" ? a.body : a.body !== undefined ? JSON.stringify(a.body) : "";
             const held = await gate("api_request", a, {
               title: "Send a destructive request", risk: "danger",
               rows: [
-                ["Request", `${a.method} ${a.url}`], ["Why flagged", why], ["Credential", `${a.secret ?? "AWS keys"} (${a.auth_type})`],
+                ["Request", `${a.method} ${a.url}`], ["Why flagged", why], ["Credential", `${a.secret} (${a.auth_type})`],
                 ...(a.query ? [["Query", JSON.stringify(a.query)] as [string, string]] : []),
                 ...(preview ? [["Body", `${preview.slice(0, 400)}${preview.length > 400 ? "..." : ""}`] as [string, string]] : []),
               ],
