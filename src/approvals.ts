@@ -14,7 +14,7 @@ type ApprovalEnv = Pick<Env, "OAUTH_KV" | "APPROVAL_STORE" | "PUBLIC_URL" | "GOO
 // What the human is shown. `risk` picks the colour and wording; `ack` (if set) is a checkbox that must be ticked to approve.
 export interface ApprovalSpec {
   title: string;
-  risk?: "danger" | "token";
+  risk?: "danger" | "token" | "write";
   rows: ([label: string, value: string] | [label: string, value: string, flag: "warn"])[];
   ack?: string;
 }
@@ -23,7 +23,7 @@ interface ApprovalRecord {
   id: string;
   tool: string;
   title?: string;
-  risk?: "danger" | "token";
+  risk?: "danger" | "token" | "write";
   rows?: ([string, string] | [string, string, "warn"])[];
   ack?: string;
   summary: string[]; // plain-text version of the rows; also what older records contain
@@ -113,12 +113,12 @@ const PAGE_HEADERS = {
 };
 
 const CSS = `
-:root{--bg:#f4f5f7;--card:#fff;--ink:#14171a;--mute:#5b6670;--line:#e2e5e9;--soft:#f7f8fa;--on:#fff;--danger:#b3261e;--token:#8a5200;--ok:#17653f;--neutral:#4b5563}
-@media (prefers-color-scheme:dark){:root{--bg:#0e1113;--card:#171b1f;--ink:#eef1f4;--mute:#99a4ae;--line:#293038;--soft:#1d2227;--on:#101315;--danger:#ff8a80;--token:#f2b955;--ok:#59d49a;--neutral:#aab4be}}
+:root{--bg:#f4f5f7;--card:#fff;--ink:#14171a;--mute:#5b6670;--line:#e2e5e9;--soft:#f7f8fa;--on:#fff;--danger:#b3261e;--token:#8a5200;--ok:#17653f;--neutral:#4b5563;--write:#1d4ed8}
+@media (prefers-color-scheme:dark){:root{--bg:#0e1113;--card:#171b1f;--ink:#eef1f4;--mute:#99a4ae;--line:#293038;--soft:#1d2227;--on:#101315;--danger:#ff8a80;--token:#f2b955;--ok:#59d49a;--neutral:#aab4be;--write:#8ab4f8}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:16px}
 .card{max-width:34rem;margin:24px auto;background:var(--card);border:1px solid var(--line);border-top:6px solid var(--tone);border-radius:16px;padding:24px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
-.tone-danger{--tone:var(--danger)}.tone-token{--tone:var(--token)}.tone-ok{--tone:var(--ok)}.tone-neutral{--tone:var(--neutral)}
+.tone-danger{--tone:var(--danger)}.tone-token{--tone:var(--token)}.tone-ok{--tone:var(--ok)}.tone-neutral{--tone:var(--neutral)}.tone-write{--tone:var(--write)}
 .head{display:flex;gap:14px;align-items:center}
 .badge{flex:none;width:44px;height:44px;border-radius:50%;display:grid;place-items:center;background:var(--tone);color:var(--on);font-size:22px;font-weight:700}
 .eyebrow{margin:0;font-size:.78rem;letter-spacing:.06em;text-transform:uppercase;color:var(--tone);font-weight:700}
@@ -128,7 +128,7 @@ h1{margin:2px 0 0;font-size:1.35rem;line-height:1.25}
 .rows div{display:grid;grid-template-columns:7rem 1fr;gap:12px;padding:10px 14px;border-top:1px solid var(--line)}
 .rows div:first-child{border-top:0}
 dt{color:var(--mute);font-size:.85rem;padding-top:1px}
-dd{margin:0;font:.9rem ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}
+dd{margin:0;font:.9rem ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere;white-space:pre-wrap;max-height:22rem;overflow:auto}
 .rows .warn{background:color-mix(in srgb,var(--danger) 10%,transparent)}
 .rows .warn dd{color:var(--danger);font-weight:700}
 .meta{font-size:.85rem;color:var(--mute);margin:8px 0 0}
@@ -147,9 +147,9 @@ form.gated:has(.ack input:not(:checked)) button.primary{opacity:.35;cursor:not-a
 p{margin:12px 0}
 `;
 
-type Tone = "danger" | "token" | "ok" | "neutral";
-const GLYPH: Record<Tone, string> = { danger: "!", token: "&#128273;", ok: "&#10003;", neutral: "i" };
-const EYEBROW: Record<Tone, string> = { danger: "Destructive action", token: "Token request", ok: "Done", neutral: "Approvals" };
+type Tone = "danger" | "token" | "write" | "ok" | "neutral";
+const GLYPH: Record<Tone, string> = { danger: "!", token: "&#128273;", write: "&#9998;", ok: "&#10003;", neutral: "i" };
+const EYEBROW: Record<Tone, string> = { danger: "Destructive action", token: "Token request", write: "Write request", ok: "Done", neutral: "Approvals" };
 
 const shell = (title: string, tone: Tone, inner: string, status = 200, extra: Record<string, string> = {}, eyebrow?: string) =>
   new Response(
@@ -193,7 +193,9 @@ async function reviewPage(env: ApprovalEnv, r: ApprovalRecord, email: string, ex
   const tone = toneOf(r);
   const lead = tone === "token"
     ? "An AI assistant is asking for a temporary access token. Whoever holds it can use it until it expires."
-    : "An AI assistant wants to make a change that can't be undone. Nothing happens unless you approve.";
+    : tone === "write"
+      ? "An AI assistant wants to change something with your credentials. Check every line, especially recipients. Nothing happens unless you approve."
+      : "An AI assistant wants to make a change that can't be undone. Nothing happens unless you approve.";
   const ack = r.ack ? `<label class=ack><input type=checkbox name=ack value=on required><span>${esc(r.ack)}</span></label>` : "";
   return shell(
     titleOf(r),

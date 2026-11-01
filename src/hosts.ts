@@ -37,7 +37,43 @@ export function commentHosts(comment: string | undefined | null): string[] {
   return m[1].split(/[,\s]+/).filter(Boolean).flatMap((x) => { try { return [validateHostPattern(x)]; } catch { return []; } });
 }
 
+// Write policy, also owner-written lines in the same comment:
+//   approve: writes                                  every POST/PUT/PATCH/DELETE with this secret needs human approval
+//   allow: POST gmail.googleapis.com/gmail/v1/users/me/drafts    except this exact method + host + path
+// In an allow path `*` matches within one path segment (never across `/`), and the whole path must match, so
+// `/v4/spreadsheets/ID/values/*:append` covers append but not `:clear`. Allow lines cannot waive approval for DELETE
+// or the other destructive patterns (destructive.ts); they only waive the general write approval. Any `approve:` line
+// turns the policy on, whatever its value, so a typo fails closed. Invalid allow lines are ignored (also fail closed).
+export interface AllowRule { method: string; host: string; path: RegExp; text: string }
+export interface WritePolicy { approveWrites: boolean; allow: AllowRule[] }
+
+const APPROVE_LINE = /^[ \t]*approve[ \t]*:/im;
+const ALLOW_LINES = /^[ \t]*allow[ \t]*:[ \t]*(.*)$/gim;
+const POLICY_LINES = /^[ \t]*(hosts|approve|allow)[ \t]*:.*$/gim;
+
+function parseAllow(raw: string): AllowRule | null {
+  const m = raw.trim().match(/^(POST|PUT|PATCH)[ \t]+([^/\s]+)(\/\S*)$/i);
+  if (!m) return null;
+  const host = m[2].toLowerCase();
+  if (host.startsWith("*.") || !HOST_RE.test(host)) return null;
+  const path = new RegExp(`^${m[3].split("*").map((s) => s.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join("[^/]*")}$`);
+  return { method: m[1].toUpperCase(), host, path, text: `${m[1].toUpperCase()} ${host}${m[3]}` };
+}
+
+export function commentPolicy(comment: string | undefined | null): WritePolicy {
+  const c = comment ?? "";
+  return { approveWrites: APPROVE_LINE.test(c), allow: [...c.matchAll(ALLOW_LINES)].flatMap((m) => parseAllow(m[1]) ?? []) };
+}
+
+// Is this write exempted by an allow line? Matched on the URL's path as sent (percent-encoded); a path with an encoded
+// slash or backslash never matches, so `*` cannot be stretched across segments.
+export function writeAllowed(policy: WritePolicy, method: string, url: URL): boolean {
+  if (/%2f|%5c/i.test(url.pathname)) return false;
+  const host = url.hostname.toLowerCase();
+  return policy.allow.some((r) => r.method === method && r.host === host && r.path.test(url.pathname));
+}
+
 export function stripHostsLines(comment: string): string {
-  return comment.replace(HOSTS_LINES, "").replace(/\n{2,}/g, "\n").trim();
+  return comment.replace(POLICY_LINES, "").replace(/\n{2,}/g, "\n").trim();
 }
 

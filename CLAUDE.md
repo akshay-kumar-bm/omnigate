@@ -15,10 +15,11 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 - `src/api-call.ts`: the `api_request` logic (auth types, host check, uploads, redaction).
 - `src/approval-store.ts` / `src/store-core.ts`: the Durable Object and its Node-testable logic (expiry, sweep).
 - `src/destructive.ts`: best-effort detection of destructive api_request calls beyond HTTP DELETE.
+- `src/preview.ts`: what the approval page shows for an api_request (pure; decodes Gmail RFC 822 messages).
 - `src/approvals.ts`: approval records (Durable Object `ApprovalStore`, strongly consistent; KV only as a test fallback), the `/approve/*` pages, and the approval Google sign-in via `/callback` (state `ap.*`).
 - `src/temp-token.ts` / `src/guide.ts`: agent-identity token minting; setup/usage text returned by `issue_temp_token` (full guide: `docs/agent-access.md`).
 - `src/uploads.ts`: `get_upload_url` (R2 presigned URLs; setup text lives here).
-- `src/hosts.ts`: validation and parsing of the `hosts:` comment line.
+- `src/hosts.ts`: validation and parsing of the `hosts:`, `approve:` and `allow:` comment lines.
 - `src/infisical.ts`: thin Infisical REST client (Universal Auth). `getSecretValue` is server-side only.
 - `src/google-handler.ts`: Google sign-in, consent page, `/callback`. Bad OAuth params return 400, not a crash.
 - `wrangler.jsonc`: config vars and the KV binding. No separate config file.
@@ -44,6 +45,14 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 archived/trashed/deleted true, URLs ending in /trash, /delete, /batchDelete, /emptyTrash or `:delete`, and Gmail send; see `src/destructive.ts`) and every `issue_temp_token` need a human: the
 first call returns `approval_required` + a link (`src/approvals.ts`); the user signs in with Google once (12 h session cookie), then each link is one click; the repeat
 call with `approval_id` runs once, only for the exact same arguments, within 15 minutes. Never bypass or weaken this.
+
+**Strict mode (per secret):** an `approve:` line in the secret's comment (owner-written, like `hosts:`) makes EVERY write
+(POST/PUT/PATCH/DELETE) with it need approval, except `allow: METHOD host/path` lines (POST/PUT/PATCH only, exact host,
+whole path, `*` = within one segment, encoded `/` never matches; `commentPolicy` / `writeAllowed` in `src/hosts.ts`,
+`writeApprovalReason` in `src/api-call.ts`). Allow lines never waive the destructive patterns. Fail closed: any `approve:`
+value turns it on; invalid allow lines are ignored. `list_secrets` shows `approval` and `allow`. The approval page text
+comes from `src/preview.ts` (decodes Gmail messages: From/To/Cc/Bcc/Reply-To/Subject/body/attachments; for `drafts/send`
+the server reads the draft's headers first).
 
 The approval page (`src/approvals.ts`) is script-free; a request can carry an `ack` checkbox that the server enforces.
 

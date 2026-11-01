@@ -50,7 +50,27 @@ Google one-time setup: Google Cloud Console → enable the APIs (Gmail, Drive, C
 These always need a human, enforced by the server (not by the model):
 - `api_request` that is destructive: method `DELETE`; a GraphQL mutation whose field names contain delete/destroy/remove/archive/purge/trash (e.g. Linear `issueDelete`); a JSON body that sets `archived`/`trashed`/`deleted`/`in_trash` to `true` (how Notion and GitHub archive); a URL whose last part is a trash/delete action (`/trash`, `/delete`, `/batchDelete`, `/emptyTrash`, `:delete`, e.g. Gmail `POST .../messages/{id}/trash`); or Gmail send (`.../messages/send`, `.../drafts/send`), which can't be undone.
 
-Everything else (reads, creates, other writes) runs automatically.
+Everything else (reads, creates, other writes) runs automatically, unless the secret is in strict mode (next section).
+
+**Strict mode: approve every write (`approve: writes`).** Pattern detection can never list every way an API can lose data (a Docs `batchUpdate` delete, a Gmail `TRASH` label, a filter, sharing a Drive file, clearing a sheet, a batch request with a DELETE inside). For a powerful credential, turn the rule around in the secret's own comment, which only the owner writes:
+```
+hosts: *.googleapis.com
+approve: writes
+allow: POST gmail.googleapis.com/gmail/v1/users/me/drafts
+allow: POST sheets.googleapis.com/v4/spreadsheets/<sheet id>/values/*:append
+```
+- `approve: writes`: every `POST`/`PUT`/`PATCH`/`DELETE` with this secret needs approval, whatever the URL or body. Reads (`GET`/`HEAD`) don't. Any `approve:` line turns it on, so a typo fails closed.
+- `allow: METHOD host/path`: the only writes that run without approval. `METHOD` is `POST`, `PUT` or `PATCH`; the host is exact (no wildcards); the whole path must match, and `*` matches within one path segment only, so `values/*:append` covers append but not `:clear`, another sheet, or a batch endpoint. Query strings are not checked, so think about them (e.g. Calendar `sendUpdates=all` emails attendees). A path with an encoded `/` never matches. Invalid lines are ignored. An allow line never waives the approval for `DELETE` or the destructive patterns above.
+- `list_secrets` shows `approval: "writes"` and the `allow` list, so the model knows in advance and can prefer an allowed action (draft instead of send).
+
+**What the approval page shows.** The method, host and decoded path, the query, why approval is needed, and the body. For Gmail send the base64 message is decoded into From / To / Cc / **Bcc** / **Reply-To** / Subject / the first lines / attachment names (Bcc, Reply-To and attachments are highlighted, since they are how mail is quietly copied or redirected). `drafts/send` carries only a draft id, so the server reads that draft's headers first and shows them.
+
+**Recommended Google setup** (defence in depth: Google refuses what the scope doesn't allow, the server asks for the rest):
+- Scopes: `gmail.modify` instead of `https://mail.google.com/` (no permanent delete, no filters or forwarding), `calendar.events` instead of `calendar` (no deleting or re-sharing calendars), plus `drive`, `documents`, `spreadsheets`.
+- The secret comment above: drafts and appending to one sheet run unattended; sending, trashing, labels, edits, sharing and invites wait for a click.
+- Scheduled agents should read and draft; you send.
+- Not covered: an agent that reads your mail and leaks it through its own shell (`curl` in Claude Code). Run mail automations without a shell or with network access restricted.
+
 1. The first call returns `approval_required` with an `approve_url` and does nothing.
 2. The user opens the link. The first time, it goes straight to Google sign-in (an account in `ALLOWED_EMAILS`); that leaves a 12-hour `HttpOnly` session cookie in their browser. After that, every approval link opens directly to a page showing the exact action with **Approve** and **Deny** buttons, so approving is one click. The page has a "Sign out of approvals" button. A model can't do this: it never has the cookie, and the confirm request needs both the cookie and a one-time nonce that was issued for that person and that approval.
 3. The model repeats the identical call with `approval_id`. The approval is bound to the exact tool and arguments (a different URL, name or body is refused), works once, and expires after 15 minutes.

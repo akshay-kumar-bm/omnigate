@@ -3,7 +3,7 @@
 // and returns only the response (with the secret redacted). A secret can only be sent to the hosts in its own
 // comment (`hosts: ...`), which are fixed when it is created (see hosts.ts), so a prompt-injected client
 // cannot point an existing token at an attacker's server.
-import { commentHosts } from "./hosts";
+import { commentHosts, commentPolicy, writeAllowed } from "./hosts";
 import { infisical } from "./infisical";
 import { extensionFor, fetchStored, MAX_STORED_BYTES, saveStored, uploadsConfigured, type UploadEnv } from "./uploads";
 
@@ -149,6 +149,31 @@ async function oauthAccessToken(name: string, value: string, approved: string[],
   return data.access_token;
 }
 
+// No path given: find the secret by name in any folder, but never guess between several.
+async function loadSecret(env: ApiCallEnv, name: string, a: Pick<ApiCallArgs, "environment" | "path">) {
+  const scope = { projectId: env.INFISICAL_PROJECT_ID, environment: a.environment ?? env.DEFAULT_ENVIRONMENT };
+  let secretPath = a.path;
+  if (secretPath === undefined) {
+    const paths = await infisical.findSecretPaths(env, name, scope);
+    if (paths.length === 0) throw new Error(`Secret ${name} not found in environment ${scope.environment}`);
+    if (paths.length > 1) throw new Error(`Secret ${name} exists in several folders (${paths.join(", ")}); pass path to choose one`);
+    secretPath = paths[0];
+  }
+  return infisical.getSecretValue(env, name, { ...scope, secretPath });
+}
+
+// Why this write needs approval under the secret's own policy (`approve: writes` in its comment), or null.
+// Reads (GET/HEAD) never do. The secret is found exactly as callApi finds it, and its value is not used here.
+export async function writeApprovalReason(env: ApiCallEnv, a: ApiCallArgs): Promise<string | null> {
+  const method = (a.method ?? "GET").toUpperCase();
+  if (method === "GET" || method === "HEAD" || !a.secret) return null;
+  const policy = commentPolicy((await loadSecret(env, a.secret, a)).comment);
+  if (!policy.approveWrites) return null;
+  const url = new URL(a.url);
+  if (writeAllowed(policy, method, url)) return null;
+  return `every write with ${a.secret} needs approval (approve: writes), and no allow line matches ${method} ${url.hostname}${url.pathname}`;
+}
+
 export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown> {
   const url = new URL(a.url);
   if (url.protocol !== "https:") throw new Error("Only https:// URLs are allowed");
@@ -158,18 +183,9 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs): Promise<unknown>
 
   const method = (a.method ?? "GET").toUpperCase();
   const authType = a.auth_type ?? "bearer";
-  const scope = { projectId: env.INFISICAL_PROJECT_ID, environment: a.environment ?? env.DEFAULT_ENVIRONMENT };
   const used: string[] = []; // secret values, for redaction
   const read = async (name: string) => {
-    // No path given: find the secret by name in any folder, but never guess between several.
-    let secretPath = a.path;
-    if (secretPath === undefined) {
-      const paths = await infisical.findSecretPaths(env, name, scope);
-      if (paths.length === 0) throw new Error(`Secret ${name} not found in environment ${scope.environment}`);
-      if (paths.length > 1) throw new Error(`Secret ${name} exists in several folders (${paths.join(", ")}); pass path to choose one`);
-      secretPath = paths[0];
-    }
-    const secret = await infisical.getSecretValue(env, name, { ...scope, secretPath });
+    const secret = await loadSecret(env, name, a);
     const approved = approvedHosts(secret.comment);
     if (!hostAllowed(url.hostname, approved)) {
       throw new Error(
