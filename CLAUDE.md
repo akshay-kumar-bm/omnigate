@@ -29,7 +29,9 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
   oauth2_refresh. `secret` is always required. There is no AWS SigV4 any more (removed on purpose; use `issue_temp_token` + the aws CLI).
   `oauth2_refresh` (Google, Microsoft, ...): the secret is JSON `{client_id, client_secret?, refresh_token, token_url, scope?}`;
   the Worker posts the refresh token to `token_url` (its host must also be in the secret's `hosts:` line), caches the access
-  token per isolate until a minute before expiry, sends it as Bearer and redacts all three values. Providers that invalidate
+  token per isolate until a minute before expiry, sends it as Bearer and redacts all three values. A secret whose value is
+  such JSON is never sent as is: with auth_type left out (or bearer) it uses oauth2_refresh automatically, and any other
+  auth_type is refused (`isOAuthSecret`). `auth_type` has no schema default, so "left out" stays visible to the server. Providers that invalidate
   the old refresh token on each refresh are not supported (the server cannot write secrets). Uploads: `multipart` or `body_base64` (5 MB cap), or `body_source` / a multipart file's `source` = the download URL (or key) from `get_upload_url`: the Worker reads the stored file from R2 itself and forwards it (40 MB cap, held in memory); only keys under `tmp/<uuid>/` in our bucket are readable, never other URLs (`fetchStored` in `src/uploads.ts`). Redirects are not followed. Upstream timeout is 3 minutes (`TIMEOUT_MS` in `src/api-call.ts`; high-quality image generation needs it).
   Downloads: `save_response: true` stores a 2xx body in R2 (`saveStored`, same `tmp/<uuid>/` keys) and returns a presigned
   download URL instead of the body (40 MB cap; refused if the bytes contain the secret; storage checked before the call).
