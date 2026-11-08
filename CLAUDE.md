@@ -51,7 +51,9 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
   `RUN_CODE_MAX_STEPS`) or in a Dynamic Worker with `globalOutbound: null` (paid, `LOADER` binding); either way it can only call
   `api.*`, `aws.call/request`, `vault.*` via the `Broker` RPC stub, which go through `callApi` + `approvalNeed` like api_request.
   A call needing approval pauses the run; the repeat call with approval_id replays journaled calls (no repeats). Never give the
-  sandbox env, secrets or a network.
+  sandbox env, secrets or a network. Free plan = 50 outbound requests per request: a run caches the Infisical index and secret
+  values (`withSecretCache` in api-call.ts), spends at most `RUN_CODE_CALL_BUDGET` (35) live calls, then returns a checkpoint;
+  `resume_run_id` continues it (journal replays are free; failed calls are retried). Failed runs return `completed_calls`.
 - `open_gateway`: ALWAYS needs approval (tick box). Returns a gateway token (`gwt_...`, max 60 min) for named secrets: HTTP via
   `/gw/<SECRET>/<host>/<path>`, AWS CLI via `AWS_ENDPOINT_URL=<worker>` + gateway key id + token as `AWS_SESSION_TOKEN` (the Worker
   re-signs). Same policy; approvals are bound to session + request so re-running the identical command works after approval.

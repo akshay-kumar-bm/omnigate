@@ -17,7 +17,7 @@ globalThis.__start = async function (input) {
   let seq = 0, active = 0; const waiting = [];
   const call = async (op) => {
     const n = seq++; // numbered when called, so Promise.all keeps a stable order on replay
-    while (active >= 20) await new Promise((r) => waiting.push(r));
+    while (active >= 6) await new Promise((r) => waiting.push(r)); // Workers allow 6 open connections at a time
     active++;
     try { return JSON.parse(await __call(n, JSON.stringify(op))); }
     finally { active--; const w = waiting.shift(); if (w) w(); }
