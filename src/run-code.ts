@@ -212,36 +212,55 @@ export async function runCode(
   }
   const props: RunProps = { runId, codeHash, secrets, purpose: a.purpose, resume };
   const timeout = (a.timeout_seconds ?? 120) * 1000;
-  let out: { ok: boolean; result?: unknown; error?: string; logs?: string[] };
-  if (loader && entry) out = await runInDynamicWorker(loader, entry, props, a, timeout);
-  else {
+  let out: { ok: boolean; result?: unknown; error?: string; logs?: string[] } = { ok: false, error: "not run" };
+  let engine = "quickjs";
+  if (loader && entry) {
+    const cpuMs = Number((env as any).RUN_CODE_CPU_MS) > 0 ? Number((env as any).RUN_CODE_CPU_MS) : undefined;
+    out = await runInDynamicWorker(loader, entry, props, a, timeout, cpuMs);
+    engine = "dynamic-worker";
+    // The sandbox itself could not start (e.g. Dynamic Workers not available on this plan): run the same code in QuickJS.
+    // Calls the first attempt finished are in the journal, so the fallback replays them instead of repeating them.
+    if ((out as { infra?: boolean }).infra && !(await s.get(pausedKey(runId)))) {
+      console.log(JSON.stringify({ run_code: { fallback: "quickjs", reason: String(out.error).slice(0, 200) } }));
+      engine = "quickjs";
+    }
+  }
+  if (engine === "quickjs") {
     const QuickJS = await (opts.quickjs ?? (async () => (await import("./quickjs-wasm")).loadQuickJS()))();
     const maxSteps = Number((env as any).RUN_CODE_MAX_STEPS) > 0 ? Number((env as any).RUN_CODE_MAX_STEPS) : 200; // ~25 interrupt checks per ms of interpreting: about 8 ms, under the free plan's 10 ms CPU
     out = await runInQuickJS(QuickJS, { code: a.code, input: a.input, timeoutMs: timeout, maxSteps, call: (seq, op) => brokerOp(env, props, seq, op) });
   }
-  return finish(s, runId, out);
+  return { ...(await finish(s, runId, out)), engine };
 }
 
 async function runInDynamicWorker(
   loader: WorkerLoader, entry: (o: { props: RunProps }) => Fetcher, props: RunProps,
-  a: { code: string; input?: unknown }, timeout: number,
-): Promise<{ ok: boolean; result?: unknown; error?: string; logs?: string[] }> {
-  const worker = loader.load({
+  a: { code: string; input?: unknown }, timeout: number, cpuMs?: number,
+): Promise<{ ok: boolean; result?: unknown; error?: string; logs?: string[]; infra?: boolean }> {
+  let worker: WorkerStub;
+  try {
+    worker = loader.load({
     compatibilityDate: "2026-09-01",
     mainModule: "main.js",
     modules: { "main.js": SHIM, "user.js": `export default async function ({ api, aws, vault, input, sleep, console }) {\n${a.code}\n}\n` },
     env: { BROKER: entry({ props }) },
     globalOutbound: null, // no network at all: only the BROKER stub
-    limits: { cpuMs: 30_000 },
-  });
+    ...(cpuMs ? { limits: { cpuMs } } : {}), // default: the plan's own limit
+    });
+  } catch (e) {
+    return { ok: false, infra: true, error: `Dynamic Worker could not be created: ${String((e as Error)?.message ?? e).slice(0, 500)}` };
+  }
   let res: Response;
   try {
     res = await worker.getEntrypoint().fetch("https://run/", { method: "POST", body: JSON.stringify({ input: a.input ?? null }), signal: AbortSignal.timeout(timeout) });
   } catch (e) {
     const m = String((e as Error)?.message ?? e);
-    return { ok: false, error: /timeout|abort/i.test(m) ? `The code did not finish within ${timeout / 1000} s` : `The code could not run: ${m.slice(0, 2000)}` };
+    if (/timeout|abort/i.test(m)) return { ok: false, error: `The code did not finish within ${timeout / 1000} s` };
+    if (/cpu|exceeded/i.test(m)) return { ok: false, error: `The code used too much CPU: ${m.slice(0, 300)}` };
+    return { ok: false, infra: true, error: `The code could not run: ${m.slice(0, 2000)}` };
   }
-  return (await res.json().catch(async () => ({ ok: false, error: (await res.text()).slice(0, 2000) }))) as { ok: boolean; result?: unknown; error?: string; logs?: string[] };
+  const text = await res.text();
+  try { return JSON.parse(text); } catch { return { ok: false, infra: true, error: text.slice(0, 2000) }; }
 }
 
 async function finish(s: ReturnType<typeof store>, runId: string, out: { ok: boolean; result?: unknown; error?: string; logs?: string[] }) {
