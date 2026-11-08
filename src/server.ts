@@ -5,7 +5,7 @@ import { infisical } from "./infisical";
 import { approvedHosts, callApi } from "./api-call";
 import { approvalNeed, approvalSpec } from "./policy";
 import { draftHeaderRows, gmailDraftSendId, type Row } from "./preview";
-import { checkApproval, requestApproval, type ApprovalSpec } from "./approvals";
+import { actionLines, checkApproval, requestApproval, type ApprovalSpec } from "./approvals";
 import { agentConfigured, mintAgentToken, probeAccess, type AccessSummary } from "./temp-token";
 import { AGENT_IDENTITY_SETUP, usage } from "./guide";
 import { commentPolicy, stripHostsLines } from "./hosts";
@@ -98,7 +98,7 @@ export function createServer(env: Env, ctx?: ExecutionContext) {
       const r = await requestApproval(env, tool, args, spec);
       return ok({
         approval_required: true, approval_id: r.id, approve_url: r.url, expires_in_minutes: r.expiresInMinutes,
-        action: [spec.title, ...spec.rows.map(([k, v]) => `${k}: ${v}`)],
+        action: actionLines(spec),
         next_step: `Tell the user to open approve_url, sign in with Google if asked, review the details${spec.ack ? ", tick the confirmation box" : ""} and press ${spec.ack ? "Give token" : "Approve"}. After they confirm, call ${tool} again with exactly the same arguments plus approval_id. Do not repeat the call before they confirm.`,
       });
     };

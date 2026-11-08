@@ -21,7 +21,8 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 - `src/gateway.ts`: open_gateway sessions and the `/gw/...` + AWS-CLI gateway (routed in index.ts before the OAuth provider).
 - `src/approval-store.ts` / `src/store-core.ts`: the Durable Object and its Node-testable logic (expiry, sweep).
 - `src/destructive.ts`: best-effort detection of destructive api_request calls beyond HTTP DELETE.
-- `src/preview.ts`: what the approval page shows for an api_request (pure; decodes Gmail RFC 822 messages).
+- `src/preview.ts`: what the approval page shows for an api_request (pure; decodes Gmail RFC 822 messages; `summarizeRequest`: the summary line, preview table and full body).
+- `src/shape.ts`: `sampleOf` (shape of a big value) and `pick` (JSONPath subset) for run_code responses.
 - `src/approvals.ts`: approval records (Durable Object `ApprovalStore`, strongly consistent; KV only as a test fallback), the `/approve/*` pages, and the approval Google sign-in via `/callback` (state `ap.*`).
 - `src/temp-token.ts` / `src/guide.ts`: agent-identity token minting; setup/usage text returned by `issue_temp_token` (full guide: `docs/agent-access.md`).
 - `src/uploads.ts`: `get_upload_url` (R2 presigned URLs; setup text lives here).
@@ -54,6 +55,9 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
   sandbox env, secrets or a network. Free plan = 50 outbound requests per request: a run caches the Infisical index and secret
   values (`withSecretCache` in api-call.ts), spends at most `RUN_CODE_CALL_BUDGET` (35) live calls, then returns a checkpoint;
   `resume_run_id` continues it (journal replays are free; failed calls are retried). Failed runs return `completed_calls`.
+  The program (code/secrets/purpose/input) is stored with the run (`run:<id>:src`), so `run_code({resume_run_id, approval_id?})`
+  is enough. Responses over 60 KB / `max_bytes` come back `truncated: true` with `body: null`, `body_text`, a `sample`
+  (`src/shape.ts`) and a hint; `pick` (JSONPath subset) keeps only some fields. api_request's own output is unchanged.
 - `open_gateway`: ALWAYS needs approval (tick box). Returns a gateway token (`gwt_...`, max 60 min) for named secrets: HTTP via
   `/gw/<SECRET>/<host>/<path>`, AWS CLI via `AWS_ENDPOINT_URL=<worker>` + gateway key id + token as `AWS_SESSION_TOKEN` (the Worker
   re-signs). Same policy; approvals are bound to session + request so re-running the identical command works after approval.

@@ -8,7 +8,7 @@ import { classifyAws, isAwsHost, type AwsInfo } from "./aws";
 import { resolveSecret, vaultHostProblems, type ApiCallArgs, type ApiCallEnv } from "./api-call";
 import { destructiveReason } from "./destructive";
 import { awsActionAllowed, commentPolicy, writeAllowed } from "./hosts";
-import { describeRequest, type Row } from "./preview";
+import { describeRequest, summarizeRequest, type Row } from "./preview";
 import type { ApprovalSpec } from "./approvals";
 
 export interface Need { why: string; destructive: boolean; aws?: AwsInfo }
@@ -46,8 +46,17 @@ export async function approvalNeed(env: ApiCallEnv, a: ApiCallArgs, headers?: He
 
 // The approval page for a call. `extra` rows go first (e.g. which run_code program or gateway session asked).
 export function approvalSpec(a: ApiCallArgs, need: Need, extra: Row[] = [], draft?: Row[]): ApprovalSpec {
-  const d = describeRequest({ ...a, method: (a.method ?? "GET").toUpperCase(), secret: a.secret ?? "" }, need.why, draft);
-  const awsRows: Row[] = need.aws ? [["AWS action", `${need.aws.service}:${need.aws.action}${need.aws.region ? ` in ${need.aws.region}` : ""}`]] : [];
+  const req = { ...a, method: (a.method ?? "GET").toUpperCase(), secret: a.secret ?? "" };
+  const d = describeRequest(req, need.why, draft, true);
+  const sm = summarizeRequest(req);
+  const awsWhere = need.aws ? `${need.aws.service}:${need.aws.action}${need.aws.region ? ` in ${need.aws.region}` : ""}` : "";
+  const awsRows: Row[] = need.aws ? [["AWS action", awsWhere]] : [];
   const title = need.aws ? `AWS ${need.aws.service}:${need.aws.action}` : d.title;
-  return { title: need.destructive ? `${title} (destructive)` : title, risk: need.destructive ? "danger" : "write", rows: [...extra, ...awsRows, ...d.rows] };
+  // Gmail send: the decoded message is in the rows; say who it goes to in the headline.
+  const to = d.rows.find((r) => r[0] === "To")?.[1], subject = d.rows.find((r) => r[0] === "Subject")?.[1];
+  const headline = to ? `Send an email to ${to}${subject ? `: "${subject}"` : ""}` : need.aws ? `AWS ${awsWhere}${sm.table ? ` (${sm.table.caption.toLowerCase()})` : ""}` : sm.summary;
+  return {
+    title: need.destructive ? `${title} (destructive)` : title, risk: need.destructive ? "danger" : "write", rows: [...extra, ...awsRows, ...d.rows],
+    headline, table: sm.table, body: sm.body, bodyBytes: sm.bodyBytes,
+  };
 }

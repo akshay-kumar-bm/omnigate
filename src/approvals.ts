@@ -17,7 +17,14 @@ export interface ApprovalSpec {
   risk?: "danger" | "token" | "write";
   rows: ([label: string, value: string] | [label: string, value: string, flag: "warn"])[];
   ack?: string;
+  headline?: string;                                             // one plain-language line: action, target, size
+  table?: { caption: string; columns: string[]; rows: string[][] }; // preview of the first records of a list body
+  body?: string;                                                 // full request body (compact, up to 200 KB), collapsed
+  bodyBytes?: number;
 }
+
+// What the model is told an approval is for: the summary line and the facts, never a dump of the body.
+export const actionLines = (spec: ApprovalSpec) => [spec.headline ?? spec.title, ...(spec.headline ? [spec.title] : []), ...spec.rows.map(([k, v]) => `${k}: ${v}`)];
 
 interface ApprovalRecord {
   id: string;
@@ -26,6 +33,10 @@ interface ApprovalRecord {
   risk?: "danger" | "token" | "write";
   rows?: ([string, string] | [string, string, "warn"])[];
   ack?: string;
+  headline?: string;
+  table?: { caption: string; columns: string[]; rows: string[][] };
+  body?: string;
+  bodyBytes?: number;
   summary: string[]; // plain-text version of the rows; also what older records contain
   fp: string;
   status: "pending" | "approved";
@@ -87,7 +98,8 @@ export async function requestApproval(env: ApprovalEnv, tool: string, args: Reco
   const id = rand();
   await save(env, {
     id, tool, title: spec.title, risk: spec.risk, rows: spec.rows, ack: spec.ack,
-    summary: [spec.title, ...spec.rows.map((x) => `${x[0]}: ${x[1]}`)],
+    headline: spec.headline, table: spec.table, body: spec.body, bodyBytes: spec.bodyBytes,
+    summary: actionLines(spec),
     fp: await fingerprint(tool, args), status: "pending", created: Date.now(),
   });
   return { id, url: approvalUrl(env, id), expiresInMinutes: TTL_SECONDS / 60 };
@@ -146,6 +158,15 @@ form.gated:has(.ack input:not(:checked)) button.primary{opacity:.35;cursor:not-a
 .foot form{margin:0}
 .link{min-height:0;padding:0;border:0;font-weight:400;color:var(--mute);text-decoration:underline;font-size:.85rem}
 p{margin:12px 0}
+.headline{font-size:1.1rem;font-weight:700;margin:16px 0 4px;overflow-wrap:anywhere}
+.tablewrap{margin:12px 0;border:1px solid var(--line);border-radius:12px;overflow:auto;max-height:24rem}
+.tablewrap table{border-collapse:collapse;width:100%;font:.82rem ui-monospace,SFMono-Regular,Menlo,monospace}
+.tablewrap caption{text-align:left;padding:8px 12px;color:var(--mute);font:.8rem system-ui,sans-serif;caption-side:top}
+.tablewrap th,.tablewrap td{padding:6px 10px;border-top:1px solid var(--line);text-align:left;white-space:nowrap;max-width:16rem;overflow:hidden;text-overflow:ellipsis}
+.tablewrap th{background:var(--soft);color:var(--mute);font-weight:600}
+details.body{margin:12px 0;border:1px solid var(--line);border-radius:12px;background:var(--soft)}
+details.body summary{cursor:pointer;padding:10px 14px;color:var(--mute);font-size:.9rem}
+details.body pre{margin:0;padding:10px 14px;border-top:1px solid var(--line);max-height:28rem;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:.8rem ui-monospace,SFMono-Regular,Menlo,monospace}
 `;
 
 type Tone = "danger" | "token" | "write" | "ok" | "neutral";
@@ -163,6 +184,15 @@ const rowsOf = (r: ApprovalRecord): ([string, string] | [string, string, "warn"]
   r.rows ?? r.summary.map((l) => { const i = l.indexOf(": "); return (i > 0 ? [l.slice(0, i), l.slice(i + 2)] : ["", l]) as [string, string]; });
 const titleOf = (r: ApprovalRecord) => r.title ?? "Approve this action?";
 const toneOf = (r: ApprovalRecord): Tone => r.risk ?? "danger";
+const kbLabel = (n?: number) => (!n ? "" : n < 1024 ? ` (${n} B)` : ` (${(n / 1024).toFixed(1)} KB)`);
+// Summary line, preview table, rows, then the full body collapsed (no script: <details>).
+const detailHtml = (r: ApprovalRecord) =>
+  `${r.headline ? `<p class=headline>${esc(r.headline)}</p>` : ""}` +
+  (r.table && r.table.rows.length
+    ? `<div class=tablewrap><table><caption>${esc(r.table.caption)}</caption><thead><tr>${r.table.columns.map((c) => `<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>${r.table.rows.map((row) => `<tr>${row.map((c) => `<td title="${esc(c)}">${esc(c)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`
+    : "") +
+  rowsHtml(r) +
+  (r.body ? `<details class=body><summary>Full request body${kbLabel(r.bodyBytes)}</summary><pre>${esc(r.body)}</pre></details>` : "");
 const rowsHtml = (r: ApprovalRecord) =>
   `<dl class=rows>${rowsOf(r).map((x) => `<div${x[2] === "warn" ? " class=warn" : ""}><dt>${esc(x[0])}</dt><dd>${esc(x[1])}</dd></div>`).join("")}</dl>`;
 const hhmm = (ms: number) => new Date(ms).toISOString().slice(11, 16) + " UTC";
@@ -201,7 +231,7 @@ async function reviewPage(env: ApprovalEnv, r: ApprovalRecord, email: string, ex
   return shell(
     titleOf(r),
     tone,
-    `<p class=lead>${lead}</p>${rowsHtml(r)}
+    `<p class=lead>${lead}</p>${detailHtml(r)}
 <p class=meta>Requested ${hhmm(r.created)} &middot; this link expires ${hhmm(r.created + TTL_SECONDS * 1000)} &middot; works once</p>
 ${error ? `<div class=err role=alert>${esc(error)}</div>` : ""}
 <form method=post action="/approve/${esc(r.id)}/confirm" class="${r.ack ? "gated" : ""}"><input type=hidden name=nonce value="${esc(nonce)}">${ack}
@@ -245,7 +275,7 @@ export async function handleApprovalRequest(req: Request, env: ApprovalEnv): Pro
 
   if (!action && req.method === "GET") {
     if (r.status === "approved") {
-      return shell("Already approved", "ok", `<p class=lead>Approved by ${esc(r.approver ?? "you")}. Tell the assistant to repeat the action.</p>${rowsHtml(r)}`);
+      return shell("Already approved", "ok", `<p class=lead>Approved by ${esc(r.approver ?? "you")}. Tell the assistant to repeat the action.</p>${detailHtml(r)}`);
     }
     const session = await getSession(req, env);
     if (session) return reviewPage(env, r, session.email); // signed in: straight to the one-click page
