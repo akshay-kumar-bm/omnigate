@@ -1,6 +1,10 @@
 # Design: credential broker, `run_code` and the agent gateway
 
-Status: **proposal, for review** (no code yet). Owner decisions so far are marked *(decided)*.
+Status: **steps 1-5 implemented** in this branch: broker core, AWS adapter, session vault, `run_code` and the gateway
+(sections 5-8 and 10; the AWS, vault, run_code and gateway parts). Not yet built: the new OAuth adapters (client
+credentials, Google service account, GitHub App), databases, the audit log page and the `/sessions` revoke page.
+Owner decisions are marked *(decided)*. Defaults chosen without an explicit answer: `ssm:SendCommand` always needs
+approval (a safe-command allow list can come later).
 
 ## 1. Problem
 
