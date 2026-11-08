@@ -1,10 +1,11 @@
-# universal-api-mcp
+# Omnigate
 
-Universal API MCP server. (The Cloudflare Worker is still named `infisical-mcp`, so its URL and the Google redirect URI are unchanged.)
+**Omnigate**: one MCP server instead of many. *Omni*: every API, AWS and multi-step task through one server. *Gate*: credentials stay behind it, every action is checked, and risky ones wait for your approval.
+(Repo `universal-api-mcp`; the Cloudflare Worker is still named `infisical-mcp`, so its URL and the Google redirect URI are unchanged.)
 
 One MCP server that lets Claude call **any HTTPS API or integration** (GitHub, Jira, Notion, Stripe, Slack, Google, ...) with credentials kept in Infisical, so the model never sees a token. Runs on Cloudflare Workers (free plan) behind Google sign-in.
 
-Four tools: **`api_request`** (main), `list_secrets` (which credentials exist and where each may be sent), `issue_temp_token` and `get_upload_url` (below). The server cannot create, change or delete secrets: the owner manages them in the Infisical dashboard. The tool list is kept short on purpose, so small models spend fewer tokens on it.
+Six tools: **`api_request`** (one call), **`run_code`** (multi-step work as JavaScript on the server), **`open_gateway`** (curl, SDKs and the real `aws` CLI from an agent's shell, through the server), `list_secrets` (which credentials exist and where each may be sent), `get_upload_url` and `issue_temp_token` (below). Design and threat model: [docs/design-credential-broker.md](docs/design-credential-broker.md). The server cannot create, change or delete secrets: the owner manages them in the Infisical dashboard. The tool list is kept short on purpose, so small models spend fewer tokens on it.
 
 **Values never come back to the client.** `list_secrets` uses `viewSecretValue=false` and returns only name, folder, approved hosts and any note.
 
@@ -27,6 +28,24 @@ comment: hosts: *.googleapis.com
 `token_url`'s host must also be in the `hosts:` line (for Microsoft: `hosts: graph.microsoft.com, login.microsoftonline.com`), so the refresh token only goes where you allowed. Optional `scope` is sent with the refresh (Microsoft wants it). Providers that invalidate the old refresh token on every refresh are not supported, because this server never writes secrets.
 Google one-time setup: Google Cloud Console → enable the APIs (Gmail, Drive, Calendar, ...) → OAuth consent screen, publishing status **In production** (unverified is fine for your own account; in Testing mode Google expires refresh tokens after 7 days) → Clients → new OAuth client of type **Web application** (not the Worker's sign-in client) with the redirect URI `https://developers.google.com/oauthplayground` → in [OAuth Playground](https://developers.google.com/oauthplayground), gear icon → "Use your own OAuth credentials", enter the scopes you want (space-separated), authorize, then "Exchange authorization code for tokens" → put the refresh token in the JSON and paste it into Infisical. One token covers every API whose scope you granted; adding a scope later means a new refresh token.
 
+**AWS: `aws`.** Store one secret per AWS identity whose value is JSON; the Worker signs every request (SigV4) and the key never leaves it:
+```
+name:    AWS_ADMIN               (folder /aws)
+value:   {"access_key_id":"AKIA...","secret_access_key":"...","region":"ap-south-1","role_arn":"arn:aws:iam::123456789012:role/agent"}
+comment: hosts: sts.ap-south-1.amazonaws.com, *.ap-south-1.amazonaws.com
+         approve: writes
+         allow: aws dynamodb:PutItem
+```
+- `role_arn` is optional but recommended: the stored keys are then only used for `sts:AssumeRole`, and requests are signed with 15-minute role credentials, so the role's IAM policy caps what any request can do. Optional `external_id`, `session_seconds`, `session_token`.
+- `*.amazonaws.com` is refused as a wildcard (anyone can create an S3 bucket under it); name hosts per region as above, plus `iam.amazonaws.com` if you use IAM.
+- AWS approvals are decided by the **action**, not the HTTP method (most AWS reads are POSTs): `Describe*`/`Get*`/`List*`/`Query`/`Scan`/S3 `GET` are reads; `Delete*`, `Terminate*`, `Stop*`, `Remove*`, `Revoke*`, ..., every IAM/Organizations/KMS change, policy changes, `ssm:SendCommand`/`StartSession` and `iam:CreateAccessKey` always need approval; anything else is a write (needs approval with `approve: writes` unless an `allow: aws service:Action` line covers it; `*` works inside the action, e.g. `allow: aws s3:Put*`). See `src/aws.ts`.
+- Reads that return secrets (`secretsmanager:GetSecretValue`, SSM `SecureString` parameters, `sts:AssumeRole`, `kms:Decrypt`, `ecr:GetAuthorizationToken`, ...) run, but the secret fields go into the **session vault** and the response shows `vault:<name>` instead.
+- `api_request` with an AWS secret: pass the endpoint URL (`https://dynamodb.ap-south-1.amazonaws.com/`), headers and body as the API expects; `aws_service`/`aws_region` only if the host doesn't make them clear. For several calls use `run_code`'s `aws.call`.
+
+**Session vault (`capture`).** Values a call returns that the model must not see, such as an API key an admin call just created, can be kept server-side: `api_request { ..., capture: { newkey: "$.key" } }` stores the value for 60 minutes (`capture_minutes`, max 24 h) and the response shows `vault:newkey`. Later calls use `secret: "vault:newkey"` or `{{vault:newkey}}` in a header, URL or body; the server substitutes it right before sending and redacts it. A vault value may only go to the hosts of the secret that produced it; sending it anywhere else needs an approval naming that host.
+
+**`approve: all`** (for production secrets): every call with the secret, reads included, needs approval.
+
 **File uploads.** `multipart` sends a `multipart/form-data` form with files; `body_base64` sends raw bytes. Both take base64 data, up to 5 MB decoded per request, and cannot be combined with `body`. Example, uploading an image to a Notion row (the same two calls the Notion docs describe):
 ```
 1. api_request { url: "https://api.notion.com/v1/file_uploads", method: "POST", secret: "NOTION_TOKEN", headers: { "Notion-Version": "2022-06-28" }, body: { filename: "card.png", content_type: "image/png" } }          -> id
@@ -42,9 +61,46 @@ Google one-time setup: Google Cloud Console → enable the APIs (Gmail, Drive, C
 - Secret references (`${OTHER}`) are not expanded when `api_request` reads a value, so a secret can't be used to leak another secret.
 - HTTPS only, default port only, redirects are not followed, 3-minute timeout, response body capped at 60 KB, uploads capped at 5 MB, secrets redacted from the body and headers. The client may not set its own `Authorization` header.
 - Secrets are read from `DEFAULT_ENVIRONMENT` (`dev`) unless `environment` is passed. Keep one Infisical folder per service (`/notion`, `/github`, ...): `api_request` finds a secret by name in any folder, refuses to guess if the same name is in several (pass `path`), and `list_secrets` searches all folders by default.
-- This is not a shell: it cannot run CLIs like `aws` or `gh`. For those, use `infisical run --env=dev -- <cmd>` in a session that has the Infisical CLI.
+- `api_request` and `run_code` are not a shell. For CLIs and SDKs on the agent's own machine use `open_gateway` (below); only as a last resort `infisical run --env=dev -- <cmd>` with a token from `issue_temp_token`.
   - With a token from `issue_temp_token`: `infisical run --token="$INFISICAL_TOKEN" --domain=https://us.infisical.com --projectId=<id> --env=dev --path=/github -- gh api user`. Use the real command after `--`, not another `infisical run`.
   - To clone with the injected token use `git` (e.g. `-c http.extraheader=...`), not `gh repo clone`: that uses GraphQL, which Claude Code sessions can't call.
+
+## Multi-step work: `run_code`
+The assistant writes JavaScript (the body of an async function) and the server runs it in an isolated sandbox with no network and no secrets: on the **free plan** in **QuickJS** (a small JavaScript engine compiled to WebAssembly, inside the Worker; `src/quick-run.ts`), on the paid plan in a fresh **Cloudflare Dynamic Worker** per run. The engine is picked automatically: the `LOADER` binding present means Dynamic Workers. The only way out is a set of helpers that run back in this Worker through the same checks as `api_request` (hosts, approvals, redaction, vault):
+```js
+// run_code { purpose: "check user 1 and the app log", secrets: ["AWS_ADMIN", "GH_TOKEN"], code: `...` }
+const [item, repos] = await Promise.all([
+  aws.call("AWS_ADMIN", { service: "dynamodb", action: "GetItem", params: { TableName: "users", Key: { id: { S: "1" } } } }),
+  api.get("GH_TOKEN", "https://api.github.com/user/repos"),
+]);
+const obj = await aws.request("AWS_ADMIN", { service: "s3", method: "GET", path: "/my-bucket/config.json" });
+const cmd = await aws.call("AWS_ADMIN", { service: "ssm", action: "SendCommand",      // asks for approval
+  params: { InstanceIds: ["i-0abc"], DocumentName: "AWS-RunShellScript", Parameters: { commands: ["tail -n 200 /var/log/app.log"] } } });
+await sleep(3000);
+const out = await aws.call("AWS_ADMIN", { service: "ssm", action: "GetCommandInvocation", params: { CommandId: cmd.body.Command.CommandId, InstanceId: "i-0abc" } });
+return { user: item.body.Item, repos: repos.body.length, config: obj.body, log: out.body.StandardOutputContent };
+```
+- Helpers: `api.get/post/put/patch/delete/request` (same arguments as `api_request`), `aws.call` (JSON and query AWS APIs; XML is parsed), `aws.request` (REST AWS APIs such as S3, path-style), `vault.list/delete`, `sleep`, `input`, `console.log`. Only the return value and logs come back (100 KB), so filter big data in code.
+- **Approvals pause the run.** A call that needs approval stops the run and returns `approval_required`; after the user approves, the assistant repeats `run_code` with the same code plus `approval_id`. Finished calls are replayed from a journal (Durable Object, 1 h), not repeated, and the approved call goes out. Changed code or arguments are refused.
+- `secrets` lists what the code may use. Limits: 300 calls, 20 in flight, 30 s CPU, 120 s wall time by default (max 600).
+- **Free plan (QuickJS):** Cloudflare gives a free Worker about 10 ms of CPU per request, so code should orchestrate calls and filter results, not compute heavily; a runaway loop is stopped after a fixed number of steps (`RUN_CODE_MAX_STEPS` var, default 200, about 8 ms) with a clear error. Waiting for APIs costs no CPU. No `fetch`, `setTimeout` or Node APIs inside; use the helpers.
+- **Dynamic Workers:** uncomment the `LOADER` Worker Loader binding in `wrangler.jsonc` and deploy; same helpers, real V8 (much faster than QuickJS within the same CPU limit). Cloudflare's pricing page lists them for Workers Paid; if they turn out not to run on your plan, `run_code` falls back to QuickJS by itself (calls that already ran are replayed, not repeated) and the result says `engine`. If Cloudflare refuses the deploy because of the binding, the previous version keeps running: comment the line out again. Optional var `RUN_CODE_CPU_MS` sets a lower CPU limit per run.
+
+## Agents with a shell: `open_gateway`
+For Claude Code and cloud sessions that want curl, an SDK or the real **`aws` CLI**, with nothing to install and no real credential in the sandbox. `open_gateway { secrets: ["AWS_ADMIN", "GH_TOKEN"], minutes: 30, purpose: "..." }` always needs approval (with a tick box) and returns a **gateway token** plus lines to run:
+```bash
+export GATEWAY_TOKEN='gwt_...'
+curl -sS -H "Authorization: Bearer $GATEWAY_TOKEN" https://infisical-mcp.shipengine-ai.workers.dev/gw/GH_TOKEN/api.github.com/user
+export AWS_ACCESS_KEY_ID=GW... AWS_SECRET_ACCESS_KEY=gateway-dummy-key AWS_SESSION_TOKEN="$GATEWAY_TOKEN"
+export AWS_ENDPOINT_URL=https://infisical-mcp.shipengine-ai.workers.dev AWS_REGION=ap-south-1 AWS_DEFAULT_REGION=ap-south-1
+aws configure set default.s3.addressing_style path
+aws dynamodb get-item --table-name users --key '{"id":{"S":"1"}}'
+```
+- HTTP: `https://<worker>/gw/<SECRET>/<api-host>/<path>`, gateway token where the API key would go (`Authorization: Bearer`/`Basic`, `x-api-key` or `x-gateway-token`); other auth styles via `x-gateway-auth: header|query|basic` and `x-gateway-header-name` etc.
+- AWS: the CLI signs with a dummy key; the Worker checks the gateway token (sent as `X-Amz-Security-Token`), takes service and region from the signature, maps them to the real endpoint and signs again with the real (or AssumeRole) credentials. Works with the AWS CLI, boto3 and the other SDKs. Newer CLIs' chunked S3 uploads are decoded.
+- Same policy as `api_request`. A request that needs approval fails with a message containing the link; after the user approves, **re-running the identical command** goes through (the approval is bound to the session and the request, once, 15 minutes).
+- The token is a gateway credential: only for this server, only the listed secrets, at most 60 minutes. Cloud sessions need the Worker's host in their environment's allowed hosts.
+- Not through the gateway: commands that sign locally (`aws s3 presign`, `aws eks get-token`, `aws rds generate-db-auth-token`) and interactive `aws ssm start-session`. Read logs with `ssm send-command` (with approval) instead of SSH.
 
 ## Approval for destructive actions
 These always need a human, enforced by the server (not by the model):

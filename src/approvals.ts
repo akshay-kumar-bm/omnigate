@@ -36,8 +36,9 @@ interface ApprovalRecord {
 // Approvals, sessions, nonces and sign-in state live in a Durable Object (strongly consistent). Workers KV is only
 // eventually consistent, so an approval made in one region could still read as "pending" elsewhere for up to a minute.
 // KV is the fallback only when the binding is absent (local tests).
-interface Store { get(k: string): Promise<string | null>; put(k: string, v: string, ttlSeconds: number): Promise<void>; delete(k: string): Promise<void> }
-const store = (env: ApprovalEnv): Store => {
+export interface Store { get(k: string): Promise<string | null>; put(k: string, v: string, ttlSeconds: number): Promise<void>; delete(k: string): Promise<void> }
+// Also used for the session vault, run_code journals and gateway sessions (all short-lived, all strongly consistent).
+export const store = (env: Pick<ApprovalEnv, "OAUTH_KV" | "APPROVAL_STORE">): Store => {
   if (env.APPROVAL_STORE) {
     const s = env.APPROVAL_STORE.get(env.APPROVAL_STORE.idFromName("global"));
     return { get: (k) => s.get(k), put: (k, v, t) => s.put(k, v, t), delete: (k) => s.delete(k) };

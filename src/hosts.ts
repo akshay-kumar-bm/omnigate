@@ -44,14 +44,23 @@ export function commentHosts(comment: string | undefined | null): string[] {
 // `/v4/spreadsheets/ID/values/*:append` covers append but not `:clear`. Allow lines cannot waive approval for DELETE
 // or the other destructive patterns (destructive.ts); they only waive the general write approval. Any `approve:` line
 // turns the policy on, whatever its value, so a typo fails closed. Invalid allow lines are ignored (also fail closed).
-export interface AllowRule { method: string; host: string; path: RegExp; text: string }
-export interface WritePolicy { approveWrites: boolean; allow: AllowRule[] }
+//   approve: all                                     every call with this secret, reads included, needs approval (prod)
+//   allow: aws dynamodb:PutItem                      AWS: an action (service:Action, `*` allowed in the action) needs no
+//                                                    write approval; never waives the always-ask AWS actions
+export interface AllowRule { method: string; host: string; path: RegExp; text: string; aws?: RegExp }
+export interface WritePolicy { approveWrites: boolean; approveAll: boolean; allow: AllowRule[] }
 
 const APPROVE_LINE = /^[ \t]*approve[ \t]*:/im;
+const APPROVE_ALL = /^[ \t]*approve[ \t]*:[ \t]*all\b/im;
 const ALLOW_LINES = /^[ \t]*allow[ \t]*:[ \t]*(.*)$/gim;
 const POLICY_LINES = /^[ \t]*(hosts|approve|allow)[ \t]*:.*$/gim;
 
 function parseAllow(raw: string): AllowRule | null {
+  const aws = raw.trim().match(/^aws[ \t]+([a-z0-9-]+):([A-Za-z0-9*]+)$/);
+  if (aws) {
+    const re = new RegExp(`^${aws[1]}:${aws[2].replace(/\*/g, "[A-Za-z0-9]*")}$`);
+    return { method: "", host: "", path: /^$/, text: `aws ${aws[1]}:${aws[2]}`, aws: re };
+  }
   const m = raw.trim().match(/^(POST|PUT|PATCH)[ \t]+([^/\s]+)(\/\S*)$/i);
   if (!m) return null;
   const host = m[2].toLowerCase();
@@ -62,7 +71,7 @@ function parseAllow(raw: string): AllowRule | null {
 
 export function commentPolicy(comment: string | undefined | null): WritePolicy {
   const c = comment ?? "";
-  return { approveWrites: APPROVE_LINE.test(c), allow: [...c.matchAll(ALLOW_LINES)].flatMap((m) => parseAllow(m[1]) ?? []) };
+  return { approveWrites: APPROVE_LINE.test(c), approveAll: APPROVE_ALL.test(c), allow: [...c.matchAll(ALLOW_LINES)].flatMap((m) => parseAllow(m[1]) ?? []) };
 }
 
 // Is this write exempted by an allow line? Matched on the URL's path as sent (percent-encoded); a path with an encoded
@@ -70,7 +79,11 @@ export function commentPolicy(comment: string | undefined | null): WritePolicy {
 export function writeAllowed(policy: WritePolicy, method: string, url: URL): boolean {
   if (/%2f|%5c/i.test(url.pathname)) return false;
   const host = url.hostname.toLowerCase();
-  return policy.allow.some((r) => r.method === method && r.host === host && r.path.test(url.pathname));
+  return policy.allow.some((r) => !r.aws && r.method === method && r.host === host && r.path.test(url.pathname));
+}
+
+export function awsActionAllowed(policy: WritePolicy, service: string, action: string): boolean {
+  return policy.allow.some((r) => r.aws?.test(`${service}:${action}`));
 }
 
 export function stripHostsLines(comment: string): string {

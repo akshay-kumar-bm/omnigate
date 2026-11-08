@@ -7,6 +7,10 @@
   // Approvals, sign-in sessions and nonces: strongly consistent storage (KV is eventually consistent).
   "durable_objects": { "bindings": [{ "name": "APPROVAL_STORE", "class_name": "ApprovalStore" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ApprovalStore"] }],
+  // run_code: each run is a fresh Dynamic Worker with no network; it can only call back through the Broker entrypoint.
+  // Dynamic Workers need the Workers Paid plan. On the free plan this binding stays off and run_code says it is not set up;
+  // after upgrading, uncomment the next line and deploy.
+  // "worker_loaders": [{ "binding": "LOADER" }],
   "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "24e5e7bc79544f20a3608707b592e1f3" }],
   "vars": {
     "INFISICAL_HOST": "https://us.infisical.com",
