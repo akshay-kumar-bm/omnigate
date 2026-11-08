@@ -172,17 +172,41 @@ async function oauthAccessToken(name: string, value: string, approved: string[],
   return data.access_token;
 }
 
+// Per-run cache (run_code): the secret index and each secret are read from Infisical once per run instead of on every
+// call (the approval check and the call itself both need the secret). On the free plan a request may make only 50
+// outbound requests, so this is what lets a run make dozens of API calls. Lives only as long as the run's env wrapper.
+interface SecretCache { index?: Promise<Map<string, string[]>>; values: Map<string, Promise<{ value: string; comment: string }>> }
+const CACHE = Symbol("secretCache");
+export function withSecretCache<E extends object>(env: E): E {
+  const e = Object.create(env) as E & { [CACHE]: SecretCache };
+  e[CACHE] = { values: new Map() };
+  return e;
+}
+const cacheOf = (env: ApiCallEnv) => (env as unknown as { [CACHE]?: SecretCache })[CACHE];
+function cached<T>(map: { get(k: string): Promise<T> | undefined; set(k: string, v: Promise<T>): unknown; delete(k: string): unknown }, key: string, make: () => Promise<T>): Promise<T> {
+  let p = map.get(key);
+  if (!p) { p = make(); map.set(key, p); p.catch(() => map.delete(key)); }
+  return p;
+}
+
 // No path given: find the secret by name in any folder, but never guess between several.
 export async function loadSecret(env: ApiCallEnv, name: string, a: Pick<ApiCallArgs, "environment" | "path">) {
   const scope = { projectId: env.INFISICAL_PROJECT_ID, environment: a.environment ?? env.DEFAULT_ENVIRONMENT };
+  const cache = cacheOf(env);
   let secretPath = a.path;
   if (secretPath === undefined) {
-    const paths = await infisical.findSecretPaths(env, name, scope);
+    let paths: string[];
+    if (cache && scope.environment === env.DEFAULT_ENVIRONMENT) {
+      cache.index ??= infisical.secretIndex(env, scope);
+      cache.index.catch(() => { cache.index = undefined; });
+      paths = (await cache.index).get(name) ?? [];
+    } else paths = await infisical.findSecretPaths(env, name, scope);
     if (paths.length === 0) throw new Error(`Secret ${name} not found in environment ${scope.environment}`);
     if (paths.length > 1) throw new Error(`Secret ${name} exists in several folders (${paths.join(", ")}); pass path to choose one`);
     secretPath = paths[0];
   }
-  return infisical.getSecretValue(env, name, { ...scope, secretPath });
+  const read = () => infisical.getSecretValue(env, name, { ...scope, secretPath: secretPath! });
+  return cache ? cached(cache.values, `${scope.environment}|${secretPath}|${name}`, read) : read();
 }
 
 // An Infisical secret or a vault handle: its value, its comment (hosts/approve/allow lines) and approved hosts.

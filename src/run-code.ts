@@ -13,7 +13,7 @@
 // No Cloudflare-only imports here (the entrypoint class is in broker-rpc.ts), so this file runs under Node for tests.
 import { z } from "zod";
 import { apiRequestSchema } from "./api-schema";
-import { callApi, resolveSecret, type ApiCallArgs, type ApiCallEnv } from "./api-call";
+import { callApi, resolveSecret, withSecretCache, type ApiCallArgs, type ApiCallEnv } from "./api-call";
 import { buildAwsCall, endpointFor, parseAwsSecret, xmlToJson } from "./aws";
 import { checkApproval, fingerprint, requestApproval, store } from "./approvals";
 import { approvalNeed, approvalSpec } from "./policy";
@@ -27,7 +27,18 @@ const JOURNAL_TTL = 60 * 60;
 const MAX_CODE = 100_000;
 const MAX_OUTPUT = 100_000;
 
-export interface RunProps { runId: string; codeHash: string; secrets: string[]; purpose: string; resume?: { approvalId: string; seq: number } }
+export interface RunProps { runId: string; codeHash: string; secrets: string[]; purpose: string; resume?: { approvalId: string; seq: number }; retryFailed?: boolean }
+
+// Per-request state of a QuickJS run (same request as the calls, so it can count them). On the free plan a request may
+// make 50 outbound requests in total; the run stops at a checkpoint before that, and resume_run_id continues it in a
+// new request with a fresh budget (finished calls are replayed from the journal, which costs no outbound request).
+export interface RunState { liveLeft: number; checkpoint?: string; calls: { step: number; call: string; status: number | string; replayed?: boolean }[] }
+const CHECKPOINT = "CHECKPOINT";
+const LIMIT_ERROR = /too many subrequests|subrequest limit/i;
+const describeCall = (a: ApiCallArgs) => {
+  const t = a.headers?.["x-amz-target"]?.split(".").pop() ?? (typeof a.body === "string" ? a.body.match(/^Action=(\w+)/)?.[1] : undefined);
+  try { const u = new URL(a.url); return `${(a.method ?? "GET").toUpperCase()} ${u.hostname}${u.pathname.slice(0, 60)}${t ? ` ${t}` : ""}`; } catch { return a.url.slice(0, 80); }
+};
 
 const awsCallOp = z.object({
   kind: z.literal("aws"), secret: z.string().min(1), service: z.string().regex(/^[a-z0-9-]{2,40}$/), region: z.string().optional(),
@@ -95,8 +106,9 @@ function shape(r: any, protocol?: "json" | "query") {
 const pausedKey = (runId: string) => `run:${runId}:paused`;
 
 // One call from the sandbox. Runs in this Worker (via broker-rpc.ts), never in the sandbox.
-export async function brokerOp(env: Env, props: RunProps, seq: number, raw: unknown): Promise<unknown> {
+export async function brokerOp(env: Env, props: RunProps, seq: number, raw: unknown, state?: RunState): Promise<unknown> {
   if (!Number.isInteger(seq) || seq < 0 || seq >= MAX_CALLS) throw new Error(`A run may make at most ${MAX_CALLS} calls`);
+  if (state?.checkpoint) throw new Error(`${CHECKPOINT}: ${state.checkpoint}`);
   const s = store(env);
   if (await s.get(pausedKey(props.runId))) throw new Error("APPROVAL_REQUIRED: this run is paused for an approval; no more calls run until it is resumed");
   const t = await toArgs(env, raw);
@@ -108,10 +120,18 @@ export async function brokerOp(env: Env, props: RunProps, seq: number, raw: unkn
   const fp = await fingerprint("run_code.call", a as unknown as Record<string, unknown>);
   const jKey = `run:${props.runId}:c:${seq}`;
   const recorded = await s.get(jKey);
-  if (recorded) {
-    const j = JSON.parse(recorded) as { fp: string; result: unknown };
-    if (j.fp !== fp) throw new Error(`Replay mismatch at call #${seq}: the code made a different call than in the first run (e.g. it used the time or a random value). Run it again without approval_id.`);
+  const j0 = recorded ? (JSON.parse(recorded) as { fp: string; result: unknown }) : null;
+  // resume_run_id retries calls that failed last time (e.g. after the owner renewed an expired key) instead of replaying them.
+  const retry = !!j0 && props.retryFailed === true && j0.fp === fp && (j0.result as { ok?: boolean })?.ok === false;
+  if (j0 && !retry) {
+    const j = j0;
+    if (j.fp !== fp) throw new Error(`Replay mismatch at call #${seq}: the code made a different call than in the first run (e.g. it used the time or a random value). Run it again without approval_id or resume_run_id.`);
+    state?.calls.push({ step: seq, call: describeCall(a), status: (j.result as { status?: number })?.status ?? "ok", replayed: true });
     return j.result;
+  }
+  if (state && state.liveLeft <= 0) {
+    state.checkpoint = "this request's budget of outbound calls is used up";
+    throw new Error(`${CHECKPOINT}: ${state.checkpoint}`);
   }
   let vaultOk = false;
   const need = await approvalNeed(env, a);
@@ -135,8 +155,18 @@ export async function brokerOp(env: Env, props: RunProps, seq: number, raw: unkn
       throw new Error(`APPROVAL_REQUIRED: ${r.url}`);
     }
   }
-  const result = shape(await callApi(env, { ...a, _vault_ok: vaultOk }), t.protocol);
+  if (state) state.liveLeft--;
+  let result: any;
+  try {
+    result = shape(await callApi(env, { ...a, _vault_ok: vaultOk }), t.protocol);
+  } catch (e) {
+    const m = String((e as Error)?.message ?? e);
+    if (state && LIMIT_ERROR.test(m)) { state.checkpoint = "Cloudflare's per-request limit on outbound requests was reached"; throw new Error(`${CHECKPOINT}: ${state.checkpoint}`); }
+    state?.calls.push({ step: seq, call: describeCall(a), status: `error: ${m.slice(0, 120)}` });
+    throw e;
+  }
   await s.put(jKey, JSON.stringify({ fp, result }), JOURNAL_TTL);
+  state?.calls.push({ step: seq, call: describeCall(a), status: result?.status ?? "ok" });
   return result;
 }
 
@@ -153,7 +183,7 @@ export default {
     let seq = 0, active = 0; const waiting = [];
     const call = async (op) => {
       const n = seq++; // numbered when called, so Promise.all keeps a stable order on replay
-      while (active >= 20) await new Promise((r) => waiting.push(r));
+      while (active >= 6) await new Promise((r) => waiting.push(r));
       active++;
       try { return await env.BROKER.call(n, op); }
       catch (e) { const m = String((e && e.message) || e); if (m.startsWith("APPROVAL_REQUIRED")) throw new ApprovalPause(m); throw new Error(m); }
@@ -182,11 +212,12 @@ export const runCodeInput = {
   input: z.unknown().optional().describe("Optional JSON value passed to the code as `input`"),
   timeout_seconds: z.number().int().min(5).max(600).default(120).describe("Wall-clock limit (default 120, max 600)"),
   approval_id: z.string().optional().describe("From an earlier approval_required response of this same code, after the user approved it"),
+  resume_run_id: z.string().uuid().optional().describe("From an earlier checkpoint (or failed run) of this same code: continue it. Calls that finished are replayed from a record, not repeated."),
 };
 
 export async function runCode(
   env: Env, ctx: ExecutionContext | undefined,
-  a: { code: string; secrets: string[]; purpose: string; input?: unknown; timeout_seconds?: number; approval_id?: string },
+  a: { code: string; secrets: string[]; purpose: string; input?: unknown; timeout_seconds?: number; approval_id?: string; resume_run_id?: string },
   opts: { quickjs?: () => Promise<QuickJSWASMModule> } = {},
 ) {
   // Paid plan: a Dynamic Worker per run. Free plan (no LOADER binding): QuickJS inside this Worker (quick-run.ts).
@@ -197,6 +228,7 @@ export async function runCode(
   const s = store(env);
   let runId: string;
   let resume: RunProps["resume"];
+  let retryFailed = false;
   if (a.approval_id) {
     const raw = await s.get(`runpause:${a.approval_id}`);
     if (!raw) throw new Error("That approval_id does not belong to a paused run, or the run expired (1 hour). Run the code again without approval_id.");
@@ -206,11 +238,18 @@ export async function runCode(
     await s.delete(pausedKey(p.runId));
     runId = p.runId;
     resume = { approvalId: a.approval_id, seq: p.seq };
+  } else if (a.resume_run_id) {
+    const meta = await s.get(`run:${a.resume_run_id}:meta`);
+    if (!meta) throw new Error("That run_id is unknown or expired (runs are kept 1 hour). Run the code again without resume_run_id.");
+    if (JSON.parse(meta).codeHash !== codeHash) throw new Error("resume_run_id belongs to a different program (code, secrets or input changed). Pass exactly the same code, secrets and input, or run again without resume_run_id.");
+    if (await s.get(pausedKey(a.resume_run_id))) throw new Error("That run is waiting for an approval: resume it with approval_id once the user has approved.");
+    runId = a.resume_run_id;
+    retryFailed = true;
   } else {
     runId = crypto.randomUUID();
     await s.put(`run:${runId}:meta`, JSON.stringify({ codeHash }), JOURNAL_TTL);
   }
-  const props: RunProps = { runId, codeHash, secrets, purpose: a.purpose, resume };
+  const props: RunProps = { runId, codeHash, secrets, purpose: a.purpose, resume, retryFailed };
   const timeout = (a.timeout_seconds ?? 120) * 1000;
   let out: { ok: boolean; result?: unknown; error?: string; logs?: string[] } = { ok: false, error: "not run" };
   let engine = "quickjs";
@@ -228,7 +267,23 @@ export async function runCode(
   if (engine === "quickjs") {
     const QuickJS = await (opts.quickjs ?? (async () => (await import("./quickjs-wasm")).loadQuickJS()))();
     const maxSteps = Number((env as any).RUN_CODE_MAX_STEPS) > 0 ? Number((env as any).RUN_CODE_MAX_STEPS) : 200; // ~25 interrupt checks per ms of interpreting: about 8 ms, under the free plan's 10 ms CPU
-    out = await runInQuickJS(QuickJS, { code: a.code, input: a.input, timeoutMs: timeout, maxSteps, call: (seq, op) => brokerOp(env, props, seq, op) });
+    const budget = Number((env as any).RUN_CODE_CALL_BUDGET) > 0 ? Number((env as any).RUN_CODE_CALL_BUDGET) : 35; // of 50 per request on the free plan; the rest covers Infisical and token refreshes
+    const state: RunState = { liveLeft: budget, calls: [] };
+    const runEnv = withSecretCache(env); // each secret is read once per request, not once per call
+    out = await runInQuickJS(QuickJS, { code: a.code, input: a.input, timeoutMs: timeout, maxSteps, call: (seq, op) => brokerOp(runEnv, props, seq, op, state) });
+    if (state.checkpoint && !(await s.get(pausedKey(runId)))) {
+      const done = state.calls.filter((c) => typeof c.status === "number").length;
+      return {
+        ok: false, checkpoint: true, run_id: runId, engine,
+        reason: `${state.checkpoint}; ${done} call${done === 1 ? "" : "s"} finished so far (kept).`,
+        ...(out.logs?.length ? { logs: out.logs } : {}),
+        next_step: `Call run_code again with exactly the same code, secrets, purpose and input plus resume_run_id: "${runId}". Finished calls are replayed from a record (not repeated, no cost) and the run continues with a fresh budget. Repeat until it returns ok. To need fewer resumes, batch work into fewer calls (e.g. one AI request for many items).`,
+      };
+    }
+    if (!out.ok && state.calls.length) {
+      return { ...(await finish(s, runId, out)), engine, run_id: runId, completed_calls: state.calls.slice(-50),
+        hint: `Calls that finished are kept for 1 hour: after fixing the cause, call run_code again with the same code, secrets, purpose and input plus resume_run_id: "${runId}" to continue without repeating them.` };
+    }
   }
   return { ...(await finish(s, runId, out)), engine };
 }
@@ -289,4 +344,7 @@ export const RUN_CODE_DESCRIPTION =
   "aws.request(secret, {service, region?, method, path, query?, headers?, body?}) for REST AWS APIs such as s3 (path-style: path '/bucket/key') and lambda; " +
   "vault.list(), vault.delete(name); sleep(ms); input (your input value). Any opts may include capture: {name: '$.json.path'} to keep a value (e.g. a new API key) server-side as vault:<name>, usable later as secret or {{vault:name}}. " +
   "List every secret the code uses in `secrets`. The same checks as api_request apply to every call (hosts, redaction, approvals). If a call needs the user's approval, the run stops and returns approval_required with a link; after they approve, call run_code again with the same code, secrets, purpose and input plus approval_id: finished steps are replayed from a record, not repeated. " +
-  "So keep the code deterministic (do not put Date.now() or random values into requests). Limits: 300 calls, 20 in flight, timeout_seconds wall time, 100 KB result; on this server's plan the code itself may only do light computation (orchestrate calls and filter results; no heavy loops), and modern syntax works but there is no fetch, setTimeout or Node API: use the helpers.";
+  "So keep the code deterministic (do not put Date.now() or random values into requests). " +
+  "LIMITS on this server (Cloudflare free plan): about 35 API calls per run_code call (the platform allows 50 outbound requests per request; replayed calls are free), 6 in flight at once, ~10 ms of CPU for your own code (orchestrate and filter; no heavy loops), timeout_seconds wall time, 100 KB result, 300 calls per run in total. " +
+  "Plan for it: batch work into few calls (e.g. send many items in ONE AI request, use list/batch endpoints) rather than one call per item. If a run reaches the per-request budget it stops at a checkpoint and returns checkpoint: true with run_id; call run_code again with the same code, secrets, purpose and input plus resume_run_id to continue (finished calls are not repeated); repeat until ok. A failed run returns completed_calls and run_id, so after fixing the cause you can resume the same way (calls that got an error status are retried, successful ones are not). console.log progress if you want it back even on failure. " +
+  "Modern syntax works, but there is no fetch, setTimeout or Node API inside: use the helpers.";

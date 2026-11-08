@@ -55,10 +55,15 @@ export const infisical = {
     return { value: v, comment: String(r.secret.secretComment ?? "") };
   },
   // Folders of every secret with this exact name (value never requested). Used when a caller omits the path.
-  findSecretPaths: async (env: InfisicalEnv, name: string, q: { projectId: string; environment: string }): Promise<string[]> => {
+  findSecretPaths: async (env: InfisicalEnv, name: string, q: { projectId: string; environment: string }): Promise<string[]> =>
+    (await infisical.secretIndex(env, q)).get(name) ?? [],
+  // Name -> folders for every secret (one request; values never requested). run_code caches it for a whole run.
+  secretIndex: async (env: InfisicalEnv, q: { projectId: string; environment: string }): Promise<Map<string, string[]>> => {
     const r = await call(env, "GET", "/api/v4/secrets", {
       query: { ...q, secretPath: "/", recursive: "true", viewSecretValue: "false", expandSecretReferences: "false", includeImports: "false" },
     });
-    return (r.secrets ?? []).filter((x: any) => x.secretKey === name).map((x: any) => String(x.secretPath ?? "/"));
+    const idx = new Map<string, string[]>();
+    for (const x of r.secrets ?? []) idx.set(x.secretKey, [...(idx.get(x.secretKey) ?? []), String(x.secretPath ?? "/")]);
+    return idx;
   },
 };
