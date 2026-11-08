@@ -48,6 +48,7 @@ export interface ApiCallArgs {
 export interface Internal {
   _raw_body?: Uint8Array;  // gateway: forward these bytes as the body
   _vault_ok?: boolean;     // a human approved sending the referenced vault values to this host
+  _full_body?: boolean;    // run_code: return the whole (redacted) body, up to 5 MB; run-code.ts applies its own limits
 }
 
 const MAX_BODY = 60_000;
@@ -482,12 +483,13 @@ export async function callApi(env: ApiCallEnv, a: ApiCallArgs & Internal): Promi
   // Captured values are replaced by their vault handles before anything else sees the text.
   const cap = res.ok ? await captureValues(env, a, p, raw, res.headers.get("content-type") ?? "") : { text: raw, vault: {} };
   const text = cap.text;
+  const bodyCap = a._full_body ? 5_000_000 : MAX_BODY;
   return {
     status: res.status,
     ok: res.ok,
     headers: out,
-    body: redact(text.length > MAX_BODY ? text.slice(0, MAX_BODY) : text),
-    truncated: text.length > MAX_BODY,
+    body: redact(text.length > bodyCap ? text.slice(0, bodyCap) : text),
+    truncated: text.length > bodyCap,
     ...(Object.keys(cap.vault).length ? { vault: cap.vault, vault_note: "These values were kept server-side; use the handles as secret or {{vault:name}} in later calls." } : {}),
     ...(res.status >= 300 && res.status < 400 ? { note: "Redirects are not followed; call the Location URL explicitly if its host is allowed." } : {}),
     ...(a.save_response && !res.ok ? { not_saved: "The API did not return a success status, so its body is shown instead of being saved." } : {}),
