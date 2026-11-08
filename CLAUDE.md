@@ -54,8 +54,8 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
   A call needing approval pauses the run; the repeat call with approval_id replays journaled calls (no repeats). Never give the
   sandbox env, secrets or a network. Free plan = 50 outbound requests per request: a run caches the Infisical index and secret
   values (`withSecretCache` in api-call.ts), spends at most `RUN_CODE_CALL_BUDGET` (35) live calls per segment; `runCode`
-  auto-continues through fresh invocations (`RunSegment` entrypoint, `ctx.exports`, max 8 segments / ~50 s), then returns a
-  checkpoint; `resume_run_id` ALONE continues it (journal replays are free; failed calls are retried only when the run's last
+  keeps calling itself through fresh invocations (`RunSegment` entrypoint, `ctx.exports`) until done (max 40 segments, 1000
+  calls per run, `RUN_CODE_AUTO_SECONDS` window, default 50 s), then returns a checkpoint with `resume_with` (exact next args); `resume_run_id` ALONE continues it (journal replays are free; failed calls are retried only when the run's last
   outcome, `run:<id>:last`, was "failed"). Failed runs return `completed_calls`.
   The program (code/secrets/purpose/input) is stored with the run (`run:<id>:src`), so `run_code({resume_run_id, approval_id?})`
   is enough. Responses over 60 KB / `max_bytes` come back `truncated: true` with `body: null`, `body_text`, a `sample`

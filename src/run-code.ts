@@ -23,7 +23,7 @@ import type { QuickJSWASMModule } from "quickjs-emscripten-core";
 import { runInQuickJS } from "./quick-run";
 import { pick, sampleOf, utf8Length } from "./shape";
 
-export const MAX_CALLS = 300;
+export const MAX_CALLS = 1000;
 const JOURNAL_TTL = 60 * 60;
 const MAX_CODE = 100_000;
 const MAX_OUTPUT = 100_000;
@@ -265,23 +265,29 @@ export const runCodeInput = {
 interface Program { code: string; secrets: string[]; purpose: string; input?: unknown; timeout_seconds?: number }
 const programHash = (p: { code: string; secrets: string[]; input?: unknown }) => hex(`${p.code}\n${[...new Set(p.secrets)].sort().join(",")}\n${JSON.stringify(p.input ?? null)}`);
 const resumeCall = (runId: string, approvalId?: string) => `run_code({resume_run_id: "${runId}"${approvalId ? `, approval_id: "${approvalId}"` : ""}})`;
+// The exact arguments of the next call, so the assistant passes them back as they are instead of rewriting the request.
+const resumeWith = (runId: string, approvalId?: string) => ({ resume_run_id: runId, ...(approvalId ? { approval_id: approvalId } : {}) });
+const PASS_ONLY = "Call run_code with exactly resume_with as its arguments: these keys only, nothing else (no code, purpose or input).";
 
 export type RunArgs = { code?: string; secrets?: string[]; purpose?: string; input?: unknown; timeout_seconds?: number; approval_id?: string; resume_run_id?: string };
-export const MAX_AUTO_SEGMENTS = 8;
-const AUTO_WALL_MS = 50_000;
+export const MAX_AUTO_SEGMENTS = 40;
+// How long one tool call keeps continuing. Claude apps stop waiting for a tool after a while, and the reply must reach
+// the assistant before that (it carries resume_with), so the default is ~50 s; clients that wait longer (Claude Code)
+// can raise it with the RUN_CODE_AUTO_SECONDS var.
+const autoWallMs = (env: Env) => (Number((env as any).RUN_CODE_AUTO_SECONDS) > 0 ? Number((env as any).RUN_CODE_AUTO_SECONDS) : 50) * 1000;
 
 // run_code as the tool sees it. On the free plan one request may make only 50 outbound requests, so a long run stops at a
 // checkpoint. Rather than making the assistant call again and again, the server continues by itself: each segment runs
 // as a fresh invocation of this Worker (the RunSegment entrypoint, ctx.exports), which gets its own per-invocation
 // limits, and resumes the same run from its journal (finished calls are replayed, not repeated). It stops at ok, an
-// approval, an error, no progress, MAX_AUTO_SEGMENTS segments or ~50 s; then the assistant resumes with resume_run_id.
+// approval, an error, no progress, MAX_AUTO_SEGMENTS segments or the time window; then the reply carries resume_with.
 export async function runCode(env: Env, ctx: ExecutionContext | undefined, a: RunArgs, opts: { quickjs?: () => Promise<QuickJSWASMModule>; segment?: boolean } = {}) {
   const seg = (ctx as any)?.exports?.RunSegment as { run(a: RunArgs): Promise<any> } | undefined; // loopback stub: each call is a new invocation
   if (opts.segment || !seg) return runOnce(env, ctx, a, opts);
   const started = Date.now();
   let r: any = await seg.run(a);
   let segments = 1;
-  while (r?.checkpoint && r.run_id && segments < MAX_AUTO_SEGMENTS && Date.now() - started < AUTO_WALL_MS) {
+  while (r?.checkpoint && r.run_id && segments < MAX_AUTO_SEGMENTS && Date.now() - started < autoWallMs(env)) {
     const before = r.finished_calls ?? 0;
     const next: any = await seg.run({ resume_run_id: r.run_id });
     segments++;
@@ -366,12 +372,14 @@ async function runOnce(env: Env, ctx: ExecutionContext | undefined, a: RunArgs, 
         ok: false, checkpoint: true, run_id: runId, engine, finished_calls: done,
         reason: `${state.checkpoint}; ${done} call${done === 1 ? "" : "s"} finished so far (kept).`,
         ...(out.logs?.length ? { logs: out.logs } : {}),
-        next_step: `Call ${resumeCall(runId)} with ONLY resume_run_id (do not resend code, purpose or input; the server kept them). Finished calls are replayed, not repeated. Repeat until ok: true. Batch work into fewer calls to need fewer resumes.`,
+        resume_with: resumeWith(runId),
+        next_step: `Not finished yet (time window of this call used up). ${PASS_ONLY} Repeat until ok: true.`,
       };
     }
     if (!out.ok && state.calls.length) {
       return { ...(await finish(s, runId, out)), engine, completed_calls: state.calls.slice(-50),
-        next_step: `After fixing the cause, call ${resumeCall(runId)} with ONLY resume_run_id (do not resend code): finished calls are not repeated, failed ones are retried. Kept 1 hour.` };
+        resume_with: resumeWith(runId),
+        next_step: `After fixing the cause: ${PASS_ONLY} Finished calls are not repeated; failed ones are retried. Kept 1 hour.` };
     }
   }
   return { ...(await finish(s, runId, out)), engine };
@@ -414,7 +422,8 @@ async function finish(s: ReturnType<typeof store>, runId: string, out: { ok: boo
     return {
       approval_required: true, run_id: runId, approval_id: p.approval_id, approve_url: p.approve_url, expires_in_minutes: p.expires_in_minutes, action: p.action,
       logs: out.logs,
-      next_step: `Tell the user to open approve_url and press Approve. After they confirm, call ${resumeCall(runId, p.approval_id)} with ONLY resume_run_id and approval_id (do not resend code, purpose or input). Steps that already ran are not repeated.`,
+      resume_with: resumeWith(runId, p.approval_id),
+      next_step: `Ask the user to open approve_url and press Approve. After they confirm: ${PASS_ONLY}`,
     };
   }
   const base = { ok: out.ok, run_id: runId, ...(out.logs?.length ? { logs: out.logs } : {}) };
@@ -438,8 +447,8 @@ export const RUN_CODE_DESCRIPTION =
   "vault.list(), vault.delete(name); sleep(ms); input (your input value). Any opts may include capture: {name: '$.json.path'} to keep a value (e.g. a new API key) server-side as vault:<name>, usable later as secret or {{vault:name}}. " +
   "RESPONSE SIZE: a response body over 60 KB (or opts.max_bytes, up to 500000) comes back with truncated: true, original_bytes, body: null, body_text (the cut-off text), sample (the shape of the full response: keys, types, array lengths, first item) and a hint. Always check r.truncated before using r.body. " +
   "To fetch less, pass opts.pick: JSON paths such as ['$.results[*].id', '$.results[*].properties.Name', '$.has_more'] and only those fields come back, in their original nesting; or use the API's own page_size/limit. " +
-  "List every secret the code uses in `secrets`. The same checks as api_request apply to every call (hosts, redaction, approvals). If a call needs the user's approval, the run stops and returns approval_required with run_id and a link; after they approve, call run_code with ONLY {resume_run_id, approval_id}. Do NOT resend code, purpose or input: the server kept the original code, and finished steps are replayed from a record, not repeated. " +
+  "List every secret the code uses in `secrets`. The same checks as api_request apply to every call (hosts, redaction, approvals). If a call needs the user's approval, the run stops and returns approval_required with a link and resume_with; after they approve, call run_code with exactly resume_with and nothing else (the server kept the code; finished steps are replayed, not repeated). " +
   "So keep the code deterministic (do not put Date.now() or random values into requests). " +
-  "LIMITS on this server (Cloudflare free plan): about 35 API calls per run_code call (the platform allows 50 outbound requests per request; replayed calls are free), 6 in flight at once, ~10 ms of CPU for your own code (orchestrate and filter; no heavy loops), timeout_seconds wall time, 100 KB return value (bigger returns truncated: true with a sample), 300 calls per run in total. " +
-  "Plan for it: batch work into few calls (e.g. send many items in ONE AI request, use list/batch endpoints) rather than one call per item. Long runs: the server continues past the per-request budget by itself (up to 8 segments, ~280 calls, ~50 s per tool call). If it still returns checkpoint: true, call run_code with ONLY {resume_run_id} (no code, purpose or input) and repeat until ok: true. A failed run returns completed_calls and run_id; after fixing the cause run_code with ONLY {resume_run_id} continues (calls that got an error status are retried, successful ones are not). " +
+  "LIMITS on this server (Cloudflare free plan): about 35 API calls per segment (the platform allows 50 outbound requests per invocation; the server chains segments by itself; replayed calls are free), 6 in flight at once, ~10 ms of CPU for your own code (orchestrate and filter; no heavy loops), timeout_seconds wall time, 100 KB return value (bigger returns truncated: true with a sample), 1000 calls per run in total. " +
+  "Plan for it: batch work into few calls (e.g. send many items in ONE AI request, use list/batch endpoints) rather than one call per item. Long runs: the server keeps calling itself until the run is complete (each segment is a fresh invocation with its own budget; up to 1000 calls per run). Only if the time window of one tool call runs out does it return checkpoint: true with resume_with; then call run_code with exactly resume_with and nothing else, until ok: true. A failed run returns completed_calls and resume_with; after fixing the cause run_code(resume_with) continues (calls that got an error status are retried, successful ones are not). " +
   "Modern syntax works, but there is no fetch, setTimeout or Node API inside: use the helpers.";
