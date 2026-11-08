@@ -1,11 +1,11 @@
-# universal-api-mcp
+# Omnigate (repo universal-api-mcp)
 
-Remote MCP server (Cloudflare Worker, TypeScript) that lets Claude call **any HTTPS API or integration**
+Omnigate: remote MCP server (Cloudflare Worker, TypeScript) that lets Claude call **any HTTPS API or integration**
 (GitHub, Jira, Notion, Stripe, Google, ...) using credentials kept in Infisical. The model passes a secret
 **name**; the Worker reads the value, adds the auth, calls the API and returns the response with the secret
 redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALLOWED_EMAILS`.
 
-- Repo: `shipengineai/universal-api-mcp` (formerly `infisical-mcp`). The Worker is still named `infisical-mcp`.
+- Name: **Omnigate** (MCP server name `omnigate`, in `src/server.ts`). Repo: `shipengineai/universal-api-mcp` (formerly `infisical-mcp`). The Worker is still named `infisical-mcp`.
 - Live URL: `https://infisical-mcp.shipengine-ai.workers.dev` (MCP endpoint: `/mcp`). Google redirect URI: `/callback`.
 - Infisical: US cloud (`https://us.infisical.com`), project id in `wrangler.jsonc`, default env `dev`.
 

@@ -1,6 +1,7 @@
-# universal-api-mcp
+# Omnigate
 
-Universal API MCP server. (The Cloudflare Worker is still named `infisical-mcp`, so its URL and the Google redirect URI are unchanged.)
+**Omnigate**: one MCP server instead of many. *Omni*: every API, AWS and multi-step task through one server. *Gate*: credentials stay behind it, every action is checked, and risky ones wait for your approval.
+(Repo `universal-api-mcp`; the Cloudflare Worker is still named `infisical-mcp`, so its URL and the Google redirect URI are unchanged.)
 
 One MCP server that lets Claude call **any HTTPS API or integration** (GitHub, Jira, Notion, Stripe, Slack, Google, ...) with credentials kept in Infisical, so the model never sees a token. Runs on Cloudflare Workers (free plan) behind Google sign-in.
 

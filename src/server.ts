@@ -53,7 +53,7 @@ const fail = (e: unknown) => ({ isError: true, content: [{ type: "text" as const
 
 
 const INSTRUCTIONS = [
-  "Universal API: make authenticated calls to any HTTPS API or integration (GitHub, Jira, Notion, Stripe, Slack, Google, ...) without ever seeing the credentials.",
+  "Omnigate: one server for every API, AWS and multi-step task. Make authenticated calls to any HTTPS API or integration (GitHub, Jira, Notion, Stripe, Slack, Google, AWS, ...) without ever seeing the credentials.",
   "Use api_request for the call itself: pass the secret NAME plus the URL, method and body; the server adds the token and returns the response with the token redacted.",
   "Use list_secrets to see which credentials exist (name, folder, hosts; never values). A secret can only be sent to its listed hosts. The owner adds and edits secrets in Infisical; this server cannot. If a credential is missing or api_request says a host is not allowed, tell the user.",
   "Secrets are organised in one folder per service (e.g. /notion/NOTION_TOKEN). api_request finds a secret by name in any folder; pass path only if the same name exists in several.",
@@ -73,10 +73,10 @@ const duration = (sec: number) =>
 export function createServer(env: Env, ctx?: ExecutionContext) {
   const server = new McpServer(
     {
-      name: "universal-api",
-      title: "Universal API",
-      version: "0.2.0",
-      description: "Call any HTTPS API or integration (GitHub, Jira, Notion, Stripe, Slack, Google, ...) with credentials kept in a vault. You never see the tokens.",
+      name: "omnigate",
+      title: "Omnigate",
+      version: "0.3.0",
+      description: "One gateway for every API, AWS and multi-step task: calls, code and CLIs with credentials kept in a vault, approvals for risky actions. You never see the tokens.",
     },
     { instructions: INSTRUCTIONS },
   );
