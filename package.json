@@ -11,10 +11,12 @@
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "1.2.1",
+    "@jitl/quickjs-wasmfile-release-sync": "0.32.0",
     "@modelcontextprotocol/client": "^2.0.0",
     "@modelcontextprotocol/server": "2.0.0",
     "agents": "0.26.0",
     "aws4fetch": "1.0.20",
+    "quickjs-emscripten-core": "0.32.0",
     "zod": "^4.0.0"
   },
   "devDependencies": {

@@ -66,7 +66,7 @@ comment: hosts: sts.ap-south-1.amazonaws.com, *.ap-south-1.amazonaws.com
   - To clone with the injected token use `git` (e.g. `-c http.extraheader=...`), not `gh repo clone`: that uses GraphQL, which Claude Code sessions can't call.
 
 ## Multi-step work: `run_code`
-The assistant writes JavaScript (the body of an async function) and the server runs it in a fresh, isolated **Cloudflare Dynamic Worker** with no network and no secrets. The only way out is a set of helpers that run back in this Worker through the same checks as `api_request` (hosts, approvals, redaction, vault):
+The assistant writes JavaScript (the body of an async function) and the server runs it in an isolated sandbox with no network and no secrets: on the **free plan** in **QuickJS** (a small JavaScript engine compiled to WebAssembly, inside the Worker; `src/quick-run.ts`), on the paid plan in a fresh **Cloudflare Dynamic Worker** per run. The engine is picked automatically: the `LOADER` binding present means Dynamic Workers. The only way out is a set of helpers that run back in this Worker through the same checks as `api_request` (hosts, approvals, redaction, vault):
 ```js
 // run_code { purpose: "check user 1 and the app log", secrets: ["AWS_ADMIN", "GH_TOKEN"], code: `...` }
 const [item, repos] = await Promise.all([
@@ -83,7 +83,8 @@ return { user: item.body.Item, repos: repos.body.length, config: obj.body, log: 
 - Helpers: `api.get/post/put/patch/delete/request` (same arguments as `api_request`), `aws.call` (JSON and query AWS APIs; XML is parsed), `aws.request` (REST AWS APIs such as S3, path-style), `vault.list/delete`, `sleep`, `input`, `console.log`. Only the return value and logs come back (100 KB), so filter big data in code.
 - **Approvals pause the run.** A call that needs approval stops the run and returns `approval_required`; after the user approves, the assistant repeats `run_code` with the same code plus `approval_id`. Finished calls are replayed from a journal (Durable Object, 1 h), not repeated, and the approved call goes out. Changed code or arguments are refused.
 - `secrets` lists what the code may use. Limits: 300 calls, 20 in flight, 30 s CPU, 120 s wall time by default (max 600).
-- Needs Cloudflare's **Workers Paid** plan (Dynamic Workers are not on the free plan): uncomment the `LOADER` Worker Loader binding in `wrangler.jsonc` and deploy. Until then `run_code` replies that it is not set up; everything else works on the free plan.
+- **Free plan (QuickJS):** Cloudflare gives a free Worker about 10 ms of CPU per request, so code should orchestrate calls and filter results, not compute heavily; a runaway loop is stopped after a fixed number of steps (`RUN_CODE_MAX_STEPS` var, default 200, about 8 ms) with a clear error. Waiting for APIs costs no CPU. No `fetch`, `setTimeout` or Node APIs inside; use the helpers.
+- **Paid plan (Dynamic Workers):** uncomment the `LOADER` Worker Loader binding in `wrangler.jsonc` and deploy; same helpers, real V8, 30 s CPU.
 
 ## Agents with a shell: `open_gateway`
 For Claude Code and cloud sessions that want curl, an SDK or the real **`aws` CLI**, with nothing to install and no real credential in the sandbox. `open_gateway { secrets: ["AWS_ADMIN", "GH_TOKEN"], minutes: 30, purpose: "..." }` always needs approval (with a tick box) and returns a **gateway token** plus lines to run:

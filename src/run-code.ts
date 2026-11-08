@@ -19,6 +19,8 @@ import { checkApproval, fingerprint, requestApproval, store } from "./approvals"
 import { approvalNeed, approvalSpec } from "./policy";
 import { isVaultName, vaultDelete, vaultList } from "./vault";
 import type { Env } from "./server";
+import type { QuickJSWASMModule } from "quickjs-emscripten-core";
+import { runInQuickJS } from "./quick-run";
 
 export const MAX_CALLS = 300;
 const JOURNAL_TTL = 60 * 60;
@@ -182,12 +184,14 @@ export const runCodeInput = {
   approval_id: z.string().optional().describe("From an earlier approval_required response of this same code, after the user approved it"),
 };
 
-export async function runCode(env: Env, ctx: ExecutionContext | undefined, a: { code: string; secrets: string[]; purpose: string; input?: unknown; timeout_seconds?: number; approval_id?: string }) {
+export async function runCode(
+  env: Env, ctx: ExecutionContext | undefined,
+  a: { code: string; secrets: string[]; purpose: string; input?: unknown; timeout_seconds?: number; approval_id?: string },
+  opts: { quickjs?: () => Promise<QuickJSWASMModule> } = {},
+) {
+  // Paid plan: a Dynamic Worker per run. Free plan (no LOADER binding): QuickJS inside this Worker (quick-run.ts).
   const loader = (env as any).LOADER as WorkerLoader | undefined;
   const entry = (ctx as any)?.exports?.Broker as ((o: { props: RunProps }) => Fetcher) | undefined;
-  if (!loader || !entry) {
-    return { configured: false, message: "run_code needs the Worker Loader binding (LOADER in wrangler.jsonc) and the Broker entrypoint. It is not available on this deployment; use api_request instead." };
-  }
   const secrets = [...new Set(a.secrets)].sort();
   const codeHash = await hex(`${a.code}\n${secrets.join(",")}\n${JSON.stringify(a.input ?? null)}`);
   const s = store(env);
@@ -207,6 +211,21 @@ export async function runCode(env: Env, ctx: ExecutionContext | undefined, a: { 
     await s.put(`run:${runId}:meta`, JSON.stringify({ codeHash }), JOURNAL_TTL);
   }
   const props: RunProps = { runId, codeHash, secrets, purpose: a.purpose, resume };
+  const timeout = (a.timeout_seconds ?? 120) * 1000;
+  let out: { ok: boolean; result?: unknown; error?: string; logs?: string[] };
+  if (loader && entry) out = await runInDynamicWorker(loader, entry, props, a, timeout);
+  else {
+    const QuickJS = await (opts.quickjs ?? (async () => (await import("./quickjs-wasm")).loadQuickJS()))();
+    const maxSteps = Number((env as any).RUN_CODE_MAX_STEPS) > 0 ? Number((env as any).RUN_CODE_MAX_STEPS) : 200; // ~25 interrupt checks per ms of interpreting: about 8 ms, under the free plan's 10 ms CPU
+    out = await runInQuickJS(QuickJS, { code: a.code, input: a.input, timeoutMs: timeout, maxSteps, call: (seq, op) => brokerOp(env, props, seq, op) });
+  }
+  return finish(s, runId, out);
+}
+
+async function runInDynamicWorker(
+  loader: WorkerLoader, entry: (o: { props: RunProps }) => Fetcher, props: RunProps,
+  a: { code: string; input?: unknown }, timeout: number,
+): Promise<{ ok: boolean; result?: unknown; error?: string; logs?: string[] }> {
   const worker = loader.load({
     compatibilityDate: "2026-09-01",
     mainModule: "main.js",
@@ -215,7 +234,6 @@ export async function runCode(env: Env, ctx: ExecutionContext | undefined, a: { 
     globalOutbound: null, // no network at all: only the BROKER stub
     limits: { cpuMs: 30_000 },
   });
-  const timeout = (a.timeout_seconds ?? 120) * 1000;
   let res: Response;
   try {
     res = await worker.getEntrypoint().fetch("https://run/", { method: "POST", body: JSON.stringify({ input: a.input ?? null }), signal: AbortSignal.timeout(timeout) });
@@ -223,7 +241,10 @@ export async function runCode(env: Env, ctx: ExecutionContext | undefined, a: { 
     const m = String((e as Error)?.message ?? e);
     return { ok: false, error: /timeout|abort/i.test(m) ? `The code did not finish within ${timeout / 1000} s` : `The code could not run: ${m.slice(0, 2000)}` };
   }
-  const out = (await res.json().catch(async () => ({ ok: false, error: (await res.text()).slice(0, 2000) }))) as { ok: boolean; result?: unknown; error?: string; logs?: string[] };
+  return (await res.json().catch(async () => ({ ok: false, error: (await res.text()).slice(0, 2000) }))) as { ok: boolean; result?: unknown; error?: string; logs?: string[] };
+}
+
+async function finish(s: ReturnType<typeof store>, runId: string, out: { ok: boolean; result?: unknown; error?: string; logs?: string[] }) {
   const paused = await s.get(pausedKey(runId));
   if (paused) {
     const p = JSON.parse(paused);
@@ -249,4 +270,4 @@ export const RUN_CODE_DESCRIPTION =
   "aws.request(secret, {service, region?, method, path, query?, headers?, body?}) for REST AWS APIs such as s3 (path-style: path '/bucket/key') and lambda; " +
   "vault.list(), vault.delete(name); sleep(ms); input (your input value). Any opts may include capture: {name: '$.json.path'} to keep a value (e.g. a new API key) server-side as vault:<name>, usable later as secret or {{vault:name}}. " +
   "List every secret the code uses in `secrets`. The same checks as api_request apply to every call (hosts, redaction, approvals). If a call needs the user's approval, the run stops and returns approval_required with a link; after they approve, call run_code again with the same code, secrets, purpose and input plus approval_id: finished steps are replayed from a record, not repeated. " +
-  "So keep the code deterministic (do not put Date.now() or random values into requests). Limits: 300 calls, 20 in flight, 30 s CPU, timeout_seconds wall time, 100 KB result.";
+  "So keep the code deterministic (do not put Date.now() or random values into requests). Limits: 300 calls, 20 in flight, timeout_seconds wall time, 100 KB result; on this server's plan the code itself may only do light computation (orchestrate calls and filter results; no heavy loops), and modern syntax works but there is no fetch, setTimeout or Node API: use the helpers.";

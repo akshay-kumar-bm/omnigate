@@ -17,7 +17,7 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 - `src/policy.ts`: the ONE approval policy for api_request, run_code and the gateway (destructive patterns, AWS actions, vault host binding, `approve:`/`allow:` lines) and the approval page spec.
 - `src/aws.ts`: AWS secrets (JSON, optional role_arn -> AssumeRole), endpoints, building JSON/query calls, classifying every AWS request by action (read/secret/write/destructive), XML->JSON, aws-chunked decoding.
 - `src/vault.ts`: session vault (Durable Object, TTL): captured values, `vault:<name>` handles, `{{vault:name}}` substitution, host binding.
-- `src/run-code.ts` / `src/broker-rpc.ts`: run_code (Worker Loader sandbox, no network; `Broker` RPC entrypoint; journal + pause/replay for approvals). broker-rpc.ts is the only file importing cloudflare:workers for this.
+- `src/run-code.ts` / `src/broker-rpc.ts`: run_code (journal + pause/replay for approvals; `brokerOp` runs every call). Engine: Dynamic Worker via the `LOADER` binding + `Broker` RPC entrypoint (paid plan; binding commented out in wrangler.jsonc) or, without it, QuickJS (`src/quick-run.ts`, free plan; `src/quickjs-wasm.ts` imports the .wasm by file path so wrangler bundles it). broker-rpc.ts is the only file importing cloudflare:workers for this.
 - `src/gateway.ts`: open_gateway sessions and the `/gw/...` + AWS-CLI gateway (routed in index.ts before the OAuth provider).
 - `src/approval-store.ts` / `src/store-core.ts`: the Durable Object and its Node-testable logic (expiry, sweep).
 - `src/destructive.ts`: best-effort detection of destructive api_request calls beyond HTTP DELETE.
@@ -47,7 +47,8 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 - `issue_temp_token`: short-lived Infisical token (limited agent identity) for CLIs like aws; ALWAYS needs approval with a
   must-tick "give token" box; refuses lifetimes over 1 h; shows the identity's measured access (read scope, can it write?). The agent identity belongs only to a separate small project (`AGENT_PROJECT_ID`, "cli-secrets"), not the main one: Infisical's plan has no per-folder roles, so a separate project is the only way to limit what a token can read. See `docs/agent-access.md`.
 - `get_upload_url`: NO approval by design. Returns a presigned R2 PUT (5 min, signs `If-None-Match: *` so only the first write to the random key succeeds) for the assistant to `curl -T <file>` (the curl also sends a `Content-Type` guessed from the file name, which Notion checks), plus a presigned GET (1 h) to hand to other APIs. Objects live under `tmp/` and a bucket lifecycle rule deletes them after 1 day (the shortest R2 allows); the tool reports whether that rule exists. Needs `R2_ACCOUNT_ID`, `R2_BUCKET` (vars) and `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` (Worker secrets); until set it returns the setup steps.
-- `run_code`: the assistant's JavaScript runs in a Dynamic Worker (Worker Loader) with `globalOutbound: null`; it can only call
+- `run_code`: the assistant's JavaScript runs in QuickJS inside the Worker (free plan, ~10 ms CPU: orchestration only; step cap
+  `RUN_CODE_MAX_STEPS`) or in a Dynamic Worker with `globalOutbound: null` (paid, `LOADER` binding); either way it can only call
   `api.*`, `aws.call/request`, `vault.*` via the `Broker` RPC stub, which go through `callApi` + `approvalNeed` like api_request.
   A call needing approval pauses the run; the repeat call with approval_id replays journaled calls (no repeats). Never give the
   sandbox env, secrets or a network.
@@ -102,7 +103,8 @@ There is no test suite. Before pushing run `npm run typecheck`. To exercise `api
 client (`InMemoryTransport` from `@modelcontextprotocol/client`), in a throwaway script (`npx tsx x.mts`, kept under the
 git-ignored `.wrangler/`) using real Infisical credentials from the environment; check status codes and redaction only. Without Infisical credentials, monkeypatch `infisical.getSecretValue`/`findSecretPaths`
 and `globalThis.fetch` in the script and pass an in-memory `OAUTH_KV` (no `APPROVAL_STORE`). run_code needs workerd: run a tiny
-test entry (exporting `Broker`, calling `runCode`) with `wrangler dev -c <test config>` that has `worker_loaders` and a local KV.
+test entry (exporting `Broker`, calling `runCode`) with `wrangler dev -c <test config>` and a local KV (with `worker_loaders` for
+the Dynamic Worker engine, without it for QuickJS). In Node, pass `{ quickjs }` (newQuickJSWASMModuleFromVariant(releaseSync)) to runCode.
 Check a deploy with:
 - `curl .../.well-known/oauth-authorization-server` returns 200.
 - `curl -i .../mcp` returns 401 with `WWW-Authenticate` (no token).
