@@ -17,7 +17,7 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
 - `src/policy.ts`: the ONE approval policy for api_request, run_code and the gateway (destructive patterns, AWS actions, vault host binding, `approve:`/`allow:` lines) and the approval page spec.
 - `src/aws.ts`: AWS secrets (JSON, optional role_arn -> AssumeRole), endpoints, building JSON/query calls, classifying every AWS request by action (read/secret/write/destructive), XML->JSON, aws-chunked decoding.
 - `src/vault.ts`: session vault (Durable Object, TTL): captured values, `vault:<name>` handles, `{{vault:name}}` substitution, host binding.
-- `src/run-code.ts` / `src/broker-rpc.ts`: run_code (journal + pause/replay for approvals; `brokerOp` runs every call). Engine: Dynamic Worker via the `LOADER` binding + `Broker` RPC entrypoint (paid plan; binding commented out in wrangler.jsonc) or, without it, QuickJS (`src/quick-run.ts`, free plan; `src/quickjs-wasm.ts` imports the .wasm by file path so wrangler bundles it). broker-rpc.ts is the only file importing cloudflare:workers for this.
+- `src/run-code.ts` / `src/broker-rpc.ts`: run_code (journal + pause/replay for approvals; `brokerOp` runs every call; `RunSegment` runs one segment per invocation). Engine: Dynamic Worker via the `LOADER` binding + `Broker` RPC entrypoint (paid plan; binding commented out in wrangler.jsonc) or, without it, QuickJS (`src/quick-run.ts`, free plan; `src/quickjs-wasm.ts` imports the .wasm by file path so wrangler bundles it). broker-rpc.ts is the only file importing cloudflare:workers for this.
 - `src/gateway.ts`: open_gateway sessions and the `/gw/...` + AWS-CLI gateway (routed in index.ts before the OAuth provider).
 - `src/approval-store.ts` / `src/store-core.ts`: the Durable Object and its Node-testable logic (expiry, sweep).
 - `src/destructive.ts`: best-effort detection of destructive api_request calls beyond HTTP DELETE.
@@ -53,8 +53,10 @@ redacted. The model never sees a token. Sign-in is Google OAuth, limited to `ALL
   `api.*`, `aws.call/request`, `vault.*` via the `Broker` RPC stub, which go through `callApi` + `approvalNeed` like api_request.
   A call needing approval pauses the run; the repeat call with approval_id replays journaled calls (no repeats). Never give the
   sandbox env, secrets or a network. Free plan = 50 outbound requests per request: a run caches the Infisical index and secret
-  values (`withSecretCache` in api-call.ts), spends at most `RUN_CODE_CALL_BUDGET` (35) live calls, then returns a checkpoint;
-  `resume_run_id` continues it (journal replays are free; failed calls are retried). Failed runs return `completed_calls`.
+  values (`withSecretCache` in api-call.ts), spends at most `RUN_CODE_CALL_BUDGET` (35) live calls per segment; `runCode`
+  auto-continues through fresh invocations (`RunSegment` entrypoint, `ctx.exports`, max 8 segments / ~50 s), then returns a
+  checkpoint; `resume_run_id` ALONE continues it (journal replays are free; failed calls are retried only when the run's last
+  outcome, `run:<id>:last`, was "failed"). Failed runs return `completed_calls`.
   The program (code/secrets/purpose/input) is stored with the run (`run:<id>:src`), so `run_code({resume_run_id, approval_id?})`
   is enough. Responses over 60 KB / `max_bytes` come back `truncated: true` with `body: null`, `body_text`, a `sample`
   (`src/shape.ts`) and a hint; `pick` (JSONPath subset) keeps only some fields. api_request's own output is unchanged.

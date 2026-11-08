@@ -6,7 +6,7 @@ import { createServer, type Env } from "./server";
 
 export type { Env } from "./server";
 export { ApprovalStore } from "./approval-store";
-export { Broker } from "./broker-rpc"; // RPC entrypoint for run_code sandboxes (ctx.exports.Broker)
+export { Broker, RunSegment } from "./broker-rpc"; // RPC entrypoints: run_code sandboxes (Broker) and run segments (RunSegment)
 
 let provider: OAuthProvider<Env> | undefined;
 export default {
