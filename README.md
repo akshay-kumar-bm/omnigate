@@ -83,7 +83,7 @@ return { user: item.body.Item, repos: repos.body.length, config: obj.body, log: 
 - Helpers: `api.get/post/put/patch/delete/request` (same arguments as `api_request`), `aws.call` (JSON and query AWS APIs; XML is parsed), `aws.request` (REST AWS APIs such as S3, path-style), `vault.list/delete`, `sleep`, `input`, `console.log`. Only the return value and logs come back (100 KB), so filter big data in code.
 - **Approvals pause the run.** A call that needs approval stops the run and returns `approval_required`; after the user approves, the assistant repeats `run_code` with the same code plus `approval_id`. Finished calls are replayed from a journal (Durable Object, 1 h), not repeated, and the approved call goes out. Changed code or arguments are refused.
 - `secrets` lists what the code may use. Limits: 300 calls, 20 in flight, 30 s CPU, 120 s wall time by default (max 600).
-- Needs the `LOADER` Worker Loader binding (`wrangler.jsonc`) and the `Broker` entrypoint exported from `src/index.ts`.
+- Needs Cloudflare's **Workers Paid** plan (Dynamic Workers are not on the free plan): uncomment the `LOADER` Worker Loader binding in `wrangler.jsonc` and deploy. Until then `run_code` replies that it is not set up; everything else works on the free plan.
 
 ## Agents with a shell: `open_gateway`
 For Claude Code and cloud sessions that want curl, an SDK or the real **`aws` CLI**, with nothing to install and no real credential in the sandbox. `open_gateway { secrets: ["AWS_ADMIN", "GH_TOKEN"], minutes: 30, purpose: "..." }` always needs approval (with a tick box) and returns a **gateway token** plus lines to run:
