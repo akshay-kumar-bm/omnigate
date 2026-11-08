@@ -252,12 +252,12 @@ export default {
 `;
 
 export const runCodeInput = {
-  code: z.string().min(1).max(MAX_CODE).optional().describe("JavaScript: the BODY of an async function (use await and return). In scope: api, aws, vault, input, sleep, console. Required for a new run; leave out when resuming (the server kept it)."),
+  code: z.string().min(1).max(MAX_CODE).optional().describe("JavaScript: the BODY of an async function (use await and return). In scope: api, aws, vault, input, sleep, console. Required for a new run. When resuming, do NOT send it: pass only resume_run_id (and approval_id)."),
   secrets: z.array(z.string().regex(/^[A-Za-z0-9_.\-]+$/)).min(1).max(20).optional().describe("Names of the secrets this code may use (vault handles are always allowed). The user sees them on any approval page. Required for a new run."),
   purpose: z.string().min(3).max(200).optional().describe("What the code does, in a sentence. Shown on approval pages. Required for a new run."),
   input: z.unknown().optional().describe("Optional JSON value passed to the code as `input`"),
   timeout_seconds: z.number().int().min(5).max(600).optional().describe("Wall-clock limit (default 120, max 600)"),
-  resume_run_id: z.string().uuid().optional().describe("run_id from an earlier pause, checkpoint or failed run: continue that run. Send just this (plus approval_id after an approval); the server has the code. Finished calls are replayed, not repeated."),
+  resume_run_id: z.string().uuid().optional().describe("run_id from an earlier checkpoint, approval_required or failed run. To continue, send ONLY this (plus approval_id after the user approved); never resend code, secrets, purpose or input. Finished calls are replayed, not repeated."),
   approval_id: z.string().optional().describe("From an approval_required response, after the user approved it (with resume_run_id)"),
 };
 
@@ -266,11 +266,33 @@ interface Program { code: string; secrets: string[]; purpose: string; input?: un
 const programHash = (p: { code: string; secrets: string[]; input?: unknown }) => hex(`${p.code}\n${[...new Set(p.secrets)].sort().join(",")}\n${JSON.stringify(p.input ?? null)}`);
 const resumeCall = (runId: string, approvalId?: string) => `run_code({resume_run_id: "${runId}"${approvalId ? `, approval_id: "${approvalId}"` : ""}})`;
 
-export async function runCode(
-  env: Env, ctx: ExecutionContext | undefined,
-  a: { code?: string; secrets?: string[]; purpose?: string; input?: unknown; timeout_seconds?: number; approval_id?: string; resume_run_id?: string },
-  opts: { quickjs?: () => Promise<QuickJSWASMModule> } = {},
-) {
+export type RunArgs = { code?: string; secrets?: string[]; purpose?: string; input?: unknown; timeout_seconds?: number; approval_id?: string; resume_run_id?: string };
+export const MAX_AUTO_SEGMENTS = 8;
+const AUTO_WALL_MS = 50_000;
+
+// run_code as the tool sees it. On the free plan one request may make only 50 outbound requests, so a long run stops at a
+// checkpoint. Rather than making the assistant call again and again, the server continues by itself: each segment runs
+// as a fresh invocation of this Worker (the RunSegment entrypoint, ctx.exports), which gets its own per-invocation
+// limits, and resumes the same run from its journal (finished calls are replayed, not repeated). It stops at ok, an
+// approval, an error, no progress, MAX_AUTO_SEGMENTS segments or ~50 s; then the assistant resumes with resume_run_id.
+export async function runCode(env: Env, ctx: ExecutionContext | undefined, a: RunArgs, opts: { quickjs?: () => Promise<QuickJSWASMModule>; segment?: boolean } = {}) {
+  const seg = (ctx as any)?.exports?.RunSegment as { run(a: RunArgs): Promise<any> } | undefined; // loopback stub: each call is a new invocation
+  if (opts.segment || !seg) return runOnce(env, ctx, a, opts);
+  const started = Date.now();
+  let r: any = await seg.run(a);
+  let segments = 1;
+  while (r?.checkpoint && r.run_id && segments < MAX_AUTO_SEGMENTS && Date.now() - started < AUTO_WALL_MS) {
+    const before = r.finished_calls ?? 0;
+    const next: any = await seg.run({ resume_run_id: r.run_id });
+    segments++;
+    const progressed = (next?.finished_calls ?? Infinity) > before || !next?.checkpoint;
+    r = next;
+    if (!progressed) break; // a segment made no progress: hand back to the assistant instead of looping
+  }
+  return segments > 1 ? { ...r, segments } : r;
+}
+
+async function runOnce(env: Env, ctx: ExecutionContext | undefined, a: RunArgs, opts: { quickjs?: () => Promise<QuickJSWASMModule> } = {}) {
   // Paid plan: a Dynamic Worker per run. Free plan (no LOADER binding): QuickJS inside this Worker (quick-run.ts).
   const loader = (env as any).LOADER as WorkerLoader | undefined;
   const entry = (ctx as any)?.exports?.Broker as ((o: { props: RunProps }) => Fetcher) | undefined;
@@ -287,7 +309,9 @@ export async function runCode(
     resume = { approvalId: a.approval_id, seq: p.seq };
   } else if (a.resume_run_id) {
     runId = a.resume_run_id;
-    retryFailed = true;
+    // Retry calls that got an error status only when resuming a run that FAILED (the cause may be fixed now, e.g. a
+    // renewed key). Continuing from a checkpoint replays them like every other finished call.
+    retryFailed = (await s.get(`run:${runId}:last`)) === "failed";
   }
 
   let program: Program;
@@ -334,18 +358,20 @@ export async function runCode(
     const runEnv = withSecretCache(env); // each secret is read once per request, not once per call
     out = await runInQuickJS(QuickJS, { code: program.code, input: program.input, timeoutMs: timeout, maxSteps, call: (seq, op) => brokerOp(runEnv, props, seq, op, state) });
     if (state.notes.length) out.logs = [...(out.logs ?? []), ...state.notes];
+    const outcome = state.checkpoint ? "checkpoint" : out.ok ? "ok" : "failed";
+    await s.put(`run:${runId}:last`, outcome, JOURNAL_TTL);
     if (state.checkpoint && !(await s.get(pausedKey(runId)))) {
       const done = state.calls.filter((c) => typeof c.status === "number").length;
       return {
-        ok: false, checkpoint: true, run_id: runId, engine,
+        ok: false, checkpoint: true, run_id: runId, engine, finished_calls: done,
         reason: `${state.checkpoint}; ${done} call${done === 1 ? "" : "s"} finished so far (kept).`,
         ...(out.logs?.length ? { logs: out.logs } : {}),
-        next_step: `${resumeCall(runId)} continues it: finished calls are replayed (not repeated, no cost) with a fresh budget. Repeat until it returns ok. Batch work into fewer calls to need fewer resumes.`,
+        next_step: `Call ${resumeCall(runId)} with ONLY resume_run_id (do not resend code, purpose or input; the server kept them). Finished calls are replayed, not repeated. Repeat until ok: true. Batch work into fewer calls to need fewer resumes.`,
       };
     }
     if (!out.ok && state.calls.length) {
       return { ...(await finish(s, runId, out)), engine, completed_calls: state.calls.slice(-50),
-        next_step: `After fixing the cause, ${resumeCall(runId)} continues without repeating finished calls (failed ones are retried). Kept 1 hour.` };
+        next_step: `After fixing the cause, call ${resumeCall(runId)} with ONLY resume_run_id (do not resend code): finished calls are not repeated, failed ones are retried. Kept 1 hour.` };
     }
   }
   return { ...(await finish(s, runId, out)), engine };
@@ -388,7 +414,7 @@ async function finish(s: ReturnType<typeof store>, runId: string, out: { ok: boo
     return {
       approval_required: true, run_id: runId, approval_id: p.approval_id, approve_url: p.approve_url, expires_in_minutes: p.expires_in_minutes, action: p.action,
       logs: out.logs,
-      next_step: `Tell the user to open approve_url and press Approve. After they confirm, call ${resumeCall(runId, p.approval_id)} (nothing else needed). Steps that already ran are not repeated.`,
+      next_step: `Tell the user to open approve_url and press Approve. After they confirm, call ${resumeCall(runId, p.approval_id)} with ONLY resume_run_id and approval_id (do not resend code, purpose or input). Steps that already ran are not repeated.`,
     };
   }
   const base = { ok: out.ok, run_id: runId, ...(out.logs?.length ? { logs: out.logs } : {}) };
@@ -412,8 +438,8 @@ export const RUN_CODE_DESCRIPTION =
   "vault.list(), vault.delete(name); sleep(ms); input (your input value). Any opts may include capture: {name: '$.json.path'} to keep a value (e.g. a new API key) server-side as vault:<name>, usable later as secret or {{vault:name}}. " +
   "RESPONSE SIZE: a response body over 60 KB (or opts.max_bytes, up to 500000) comes back with truncated: true, original_bytes, body: null, body_text (the cut-off text), sample (the shape of the full response: keys, types, array lengths, first item) and a hint. Always check r.truncated before using r.body. " +
   "To fetch less, pass opts.pick: JSON paths such as ['$.results[*].id', '$.results[*].properties.Name', '$.has_more'] and only those fields come back, in their original nesting; or use the API's own page_size/limit. " +
-  "List every secret the code uses in `secrets`. The same checks as api_request apply to every call (hosts, redaction, approvals). If a call needs the user's approval, the run stops and returns approval_required with run_id and a link; after they approve, call run_code({resume_run_id, approval_id}) with nothing else: the server kept the code, and finished steps are replayed from a record, not repeated. " +
+  "List every secret the code uses in `secrets`. The same checks as api_request apply to every call (hosts, redaction, approvals). If a call needs the user's approval, the run stops and returns approval_required with run_id and a link; after they approve, call run_code with ONLY {resume_run_id, approval_id}. Do NOT resend code, purpose or input: the server kept the original code, and finished steps are replayed from a record, not repeated. " +
   "So keep the code deterministic (do not put Date.now() or random values into requests). " +
   "LIMITS on this server (Cloudflare free plan): about 35 API calls per run_code call (the platform allows 50 outbound requests per request; replayed calls are free), 6 in flight at once, ~10 ms of CPU for your own code (orchestrate and filter; no heavy loops), timeout_seconds wall time, 100 KB return value (bigger returns truncated: true with a sample), 300 calls per run in total. " +
-  "Plan for it: batch work into few calls (e.g. send many items in ONE AI request, use list/batch endpoints) rather than one call per item. If a run reaches the per-request budget it stops at a checkpoint (checkpoint: true, run_id); call run_code({resume_run_id}) to continue, repeating until ok. A failed run returns completed_calls and run_id; after fixing the cause run_code({resume_run_id}) continues (calls that got an error status are retried, successful ones are not). " +
+  "Plan for it: batch work into few calls (e.g. send many items in ONE AI request, use list/batch endpoints) rather than one call per item. Long runs: the server continues past the per-request budget by itself (up to 8 segments, ~280 calls, ~50 s per tool call). If it still returns checkpoint: true, call run_code with ONLY {resume_run_id} (no code, purpose or input) and repeat until ok: true. A failed run returns completed_calls and run_id; after fixing the cause run_code with ONLY {resume_run_id} continues (calls that got an error status are retried, successful ones are not). " +
   "Modern syntax works, but there is no fetch, setTimeout or Node API inside: use the helpers.";
