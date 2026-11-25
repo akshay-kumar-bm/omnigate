@@ -12,7 +12,7 @@
   // after upgrading, uncomment the next line and deploy.
   // "worker_loaders": [{ "binding": "LOADER" }],
   "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "${OAUTH_KV_ID}" }],
-  // Values written as ${NAME} are filled in at deploy time from GitHub Actions variables (see README, "Deploying your own").
+  // Dollar-brace placeholders are filled in at deploy time from GitHub Actions variables (see README, "Deploying your own").
   "vars": {
     "INFISICAL_HOST": "https://us.infisical.com",
     "INFISICAL_PROJECT_ID": "${INFISICAL_PROJECT_ID}",
