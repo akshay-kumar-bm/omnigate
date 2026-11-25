@@ -24,6 +24,18 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: Fill in deployment config from Actions variables
+        run: |
+          envsubst '${INFISICAL_PROJECT_ID} ${AGENT_PROJECT_ID} ${R2_ACCOUNT_ID} ${ALLOWED_EMAILS} ${PUBLIC_URL} ${OAUTH_KV_ID}' < wrangler.jsonc > wrangler.filled.jsonc
+          mv wrangler.filled.jsonc wrangler.jsonc
+          if grep -n '\${' wrangler.jsonc; then echo "A deployment variable is missing in Settings > Secrets and variables > Actions > Variables"; exit 1; fi
+        env:
+          INFISICAL_PROJECT_ID: ${{ vars.INFISICAL_PROJECT_ID }}
+          AGENT_PROJECT_ID: ${{ vars.AGENT_PROJECT_ID }}
+          R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+          ALLOWED_EMAILS: ${{ vars.ALLOWED_EMAILS }}
+          PUBLIC_URL: ${{ vars.PUBLIC_URL }}
+          OAUTH_KV_ID: ${{ vars.OAUTH_KV_ID }}
       - run: npm ci --legacy-peer-deps
       - run: npm run typecheck
       - run: npx wrangler deploy

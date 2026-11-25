@@ -185,3 +185,18 @@ Pushes to `main` deploy automatically via GitHub Actions (`.github/workflows/dep
 ## Notes
 - Verified against Infisical docs: v4 list/get/delete secrets, v2 folders. v4 create/update and the environments lookup follow the same shape but were not checked live; test them first.
 - Local dev: `.dev.vars` with the four secrets, `PUBLIC_URL=http://localhost:8787`, `npx wrangler dev`.
+
+## Deploying your own
+
+`wrangler.jsonc` uses placeholders like `${OAUTH_KV_ID}` for account-specific values. The deploy workflow fills them in from GitHub Actions **variables** (Settings → Secrets and variables → Actions → Variables):
+
+| Variable | What it is |
+|---|---|
+| `OAUTH_KV_ID` | ID of your Cloudflare KV namespace for OAuth state |
+| `INFISICAL_PROJECT_ID` | Infisical project holding your API secrets |
+| `AGENT_PROJECT_ID` | Infisical project used by the agent tools |
+| `R2_ACCOUNT_ID` | Cloudflare account ID that owns the R2 upload bucket |
+| `ALLOWED_EMAILS` | Comma-separated emails allowed to sign in |
+| `PUBLIC_URL` | Public URL of your deployed Worker |
+
+The workflow also needs the `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` **secrets**. For local `wrangler dev`, fill the placeholders in a local copy and don't commit it.

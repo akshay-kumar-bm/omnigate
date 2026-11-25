@@ -11,16 +11,17 @@
   // Dynamic Workers need the Workers Paid plan. On the free plan this binding stays off and run_code says it is not set up;
   // after upgrading, uncomment the next line and deploy.
   // "worker_loaders": [{ "binding": "LOADER" }],
-  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "24e5e7bc79544f20a3608707b592e1f3" }],
+  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "${OAUTH_KV_ID}" }],
+  // Values written as ${NAME} are filled in at deploy time from GitHub Actions variables (see README, "Deploying your own").
   "vars": {
     "INFISICAL_HOST": "https://us.infisical.com",
-    "INFISICAL_PROJECT_ID": "e550c9ba-7757-4c6f-a3c2-ca83e8ec20b3",
-    "AGENT_PROJECT_ID": "cd937b43-5001-4e01-b920-8e7ccc4ad52c",
+    "INFISICAL_PROJECT_ID": "${INFISICAL_PROJECT_ID}",
+    "AGENT_PROJECT_ID": "${AGENT_PROJECT_ID}",
     "DEFAULT_ENVIRONMENT": "dev",
-    "R2_ACCOUNT_ID": "91f34fa3cd0f744088f5b34bf3e1e589",
+    "R2_ACCOUNT_ID": "${R2_ACCOUNT_ID}",
     "R2_BUCKET": "universal-api-uploads",
-    "ALLOWED_EMAILS": "akshaykumarbedre.bm@gmail.com,shipengine.ai@gmail.com",
-    "PUBLIC_URL": "https://infisical-mcp.shipengine-ai.workers.dev"
+    "ALLOWED_EMAILS": "${ALLOWED_EMAILS}",
+    "PUBLIC_URL": "${PUBLIC_URL}"
   },
   "observability": { "enabled": true }
 }
