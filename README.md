@@ -1,34 +1,303 @@
 # Omnigate
 
-**Omnigate**: one MCP server instead of many. *Omni*: every API, AWS and multi-step task through one server. *Gate*: credentials stay behind it, every action is checked, and risky ones wait for your approval.
-(Repo `universal-api-mcp`; the Cloudflare Worker is still named `infisical-mcp`, so its URL and the Google redirect URI are unchanged.)
+**Let Claude call any API, AWS service or multi-step workflow — GitHub, Notion, Gmail, Linear, Stripe, Slack, Jira, AWS and more — without ever seeing your tokens.**
 
-One MCP server that lets Claude call **any HTTPS API or integration** (GitHub, Jira, Notion, Stripe, Slack, Google, ...) with credentials kept in Infisical, so the model never sees a token. Runs on Cloudflare Workers (free plan) behind Google sign-in.
+Omnigate is a remote [MCP](https://modelcontextprotocol.io) server you deploy once on Cloudflare Workers (free plan). Your API keys live in [Infisical](https://infisical.com), a secrets vault. When Claude needs to call an API, it passes only the secret's **name**. The server looks up the real token, checks the call against your rules, makes it, removes the token from the response and hands back just the result.
 
-Six tools: **`api_request`** (one call), **`run_code`** (multi-step work as JavaScript on the server), **`open_gateway`** (curl, SDKs and the real `aws` CLI from an agent's shell, through the server), `list_secrets` (which credentials exist and where each may be sent), `get_upload_url` and `issue_temp_token` (below). Design and threat model: [docs/design-credential-broker.md](docs/design-credential-broker.md). The server cannot create, change or delete secrets: the owner manages them in the Infisical dashboard. The tool list is kept short on purpose, so small models spend fewer tokens on it.
+- ***Omni***: every HTTPS API, AWS and multi-step task through one server.
+- ***Gate***: credentials stay behind it, every action is checked, and risky ones wait for your click.
 
-**Values never come back to the client.** `list_secrets` uses `viewSecretValue=false` and returns only name, folder, approved hosts and any note.
-
-## Making API calls: `api_request`
-Connect this MCP to any Claude session and it can call any HTTPS API or integration with a stored token without ever seeing the token. To connect a new integration: add its token in Infisical with a `hosts:` comment line (below). No redeploy needed. The model passes the secret *name*; the Worker reads the value from Infisical, adds the auth, calls the API and returns only the response (the token is redacted from it).
+No more pasting tokens into chat. No token in the model's context, the chat log or any prompt.
 
 ```
-api_request { url: "https://api.notion.com/v1/users/me", secret: "NOTION_TOKEN", headers: { "Notion-Version": "2022-06-28" } }
-api_request { url: "https://api.github.com/user", secret: "GH_TOKEN" }
-api_request { url: "https://gmail.googleapis.com/gmail/v1/users/me/messages", auth_type: "oauth2_refresh", secret: "GOOGLE_OAUTH" }
+You:    "List my open GitHub issues and add each one to my Notion task board."
+Claude: run_code {
+          const issues = await api.get("GITHUB_TOKEN", "https://api.github.com/issues");
+          for (const i of issues.body) await api.post("NOTION_TOKEN", "https://api.notion.com/v1/pages", {...});
+        }
+        → Done. 7 issues added.        (Claude never saw either token.)
 ```
-`auth_type`: `bearer` (default), `header` (`header_name`, `header_prefix`), `basic` (`secret` = `user:pass`, or `username` + secret as password), `query` (`query_param`), `oauth2_refresh` (below).
 
-**OAuth APIs (Google, Microsoft, ...): `oauth2_refresh`.** These need a short-lived access token instead of a fixed key. Store one secret whose value is JSON, and the Worker trades the refresh token for an access token (cached until a minute before it expires) and sends it as `Bearer`:
+---
+
+## Contents
+
+- [Why use it](#why-use-it)
+- [How it works](#how-it-works)
+- [Tools](#tools)
+- [Setup (about 20 minutes)](#setup-about-20-minutes)
+- [Connect it to Claude](#connect-it-to-claude)
+- [Add your API tokens](#add-your-api-tokens)
+- [Using it](#using-it)
+- [Multi-step work: `run_code`](#multi-step-work-run_code)
+- [Agents with a shell: `open_gateway`](#agents-with-a-shell-open_gateway)
+- [Approvals for risky actions](#approvals-for-risky-actions)
+- [Big files and binary output](#big-files-and-binary-output)
+- [Temporary CLI tokens: `issue_temp_token`](#temporary-cli-tokens-issue_temp_token)
+- [Security model and limits](#security-model-and-limits)
+- [Troubleshooting](#troubleshooting)
+- [Local development](#local-development)
+- [Project layout](#project-layout)
+- [License](#license)
+
+---
+
+## Why use it
+
+| Without Omnigate | With Omnigate |
+|---|---|
+| You paste a token into the chat, and it sits in the conversation history | Tokens stay in your vault, and Claude only knows their names |
+| One MCP server per service (GitHub MCP, Notion MCP, Linear MCP, ...) | **One server for every HTTPS API and AWS** |
+| Every API call is a separate tool call, each one filling the context | **`run_code`** does loops, parallel calls and filtering on the server in one call |
+| A prompt-injected page could trick the model into sending your token somewhere else | Each token is **locked to its own hosts**; a GitHub token can only ever go to `api.github.com` |
+| Deletes and sends happen as soon as the model decides | **Deletes, sends and (optionally) every write need your click** on an approval page |
+| Adding a new service means new code or a new server | Add a token with its hosts in Infisical. **No redeploy.** |
+
+**Good for:** anyone who uses Claude (claude.ai, Claude Desktop, Claude Code) with real accounts and wants it to work across many services safely. The tool list is kept short on purpose, so even small models spend few tokens on it.
+
+---
+
+## How it works
+
+```mermaid
+sequenceDiagram
+    participant C as Claude
+    participant W as Omnigate (your Cloudflare Worker)
+    participant V as Infisical (your vault)
+    participant A as Any API (e.g. api.github.com)
+    C->>W: api_request { url, secret: "GITHUB_TOKEN" }
+    W->>V: read GITHUB_TOKEN + its allowed hosts and rules
+    W->>W: allowed host? destructive? needs approval?
+    W->>A: HTTPS request with the token added
+    A-->>W: response
+    W-->>C: response with the token redacted
+```
+
+- **Sign-in:** the server sits behind Google sign-in. Only emails you list in `ALLOWED_EMAILS` can connect.
+- **Vault:** secrets are read live from Infisical, so you add or rotate a token there and it works right away.
+- **Read-only server:** Omnigate never creates, edits or deletes secrets. You manage them in the Infisical dashboard, so a tricked model can't change where a token may go.
+- **Host lock:** every secret carries a `hosts:` line saying where it may be sent. No line, no sending.
+
+Design and threat model: [docs/design-credential-broker.md](docs/design-credential-broker.md).
+
+---
+
+## Tools
+
+Once connected, Claude sees six tools. You don't call them yourself; just ask Claude in plain language.
+
+| Tool | What it does | Needs your approval? |
+|---|---|---|
+| **`api_request`** | The main tool. One authenticated HTTPS call to any API using a stored secret; returns the response with the secret redacted. JSON bodies, query params, headers, file uploads, OAuth refresh and AWS signing. | Only for risky calls (see [Approvals](#approvals-for-risky-actions)) |
+| **`run_code`** | Multi-step work: Claude writes JavaScript that the server runs in an isolated sandbox. Loops, parallel calls, AWS, filtering big responses, all in one tool call. | Pauses for the same risky calls |
+| **`open_gateway`** | For agents with a shell (Claude Code, cloud sessions): use `curl`, SDKs and the real `aws` CLI through the server, with no real credential in the sandbox. | **Always**, with a must-tick box |
+| `list_secrets` | Lists secret names, folders, notes, allowed hosts and approval rules. **Never values.** | No |
+| `get_upload_url` | Move big files (and binary API output) without sending them through the chat. | No |
+| `issue_temp_token` | Last resort for interactive CLIs: a short-lived (1 hour max) Infisical token from a separate limited identity. | **Always**, with a must-tick box |
+
+### Auth types for `api_request`
+
+| `auth_type` | Sends | Use for |
+|---|---|---|
+| `bearer` (default) | `Authorization: Bearer <token>` | GitHub, Notion, Stripe, Slack, OpenAI, most APIs |
+| `header` | `<header_name>: [<header_prefix> ]<token>` | APIs with a custom header, e.g. `X-API-Key`, or Linear (`Authorization: <key>`) |
+| `basic` | `Authorization: Basic ...` (secret is `user:password`, or pass `username` and store just the password) | Jira / Confluence (`email:api_token`), Twilio |
+| `query` | `?<query_param>=<token>` | APIs that take the key in the URL |
+| `oauth2_refresh` | Trades a stored refresh token for a short-lived access token, sent as `Bearer` | Google (Gmail, Drive, Calendar, Sheets), Microsoft Graph |
+| `aws` | AWS Signature V4, optionally via STS `AssumeRole` | Any AWS API: DynamoDB, S3, SSM, EC2, ... |
+
+`oauth2_refresh` and `aws` are picked automatically for secrets of that kind.
+
+---
+
+## Setup (about 20 minutes)
+
+### What you need
+
+- A **Cloudflare** account (free plan is fine)
+- An **Infisical** account (free plan is fine), on US or EU cloud
+- A **Google Cloud** project (for the sign-in screen; free)
+- **Node.js 20+** and **git**
+
+### 1. Get the code
+
+```bash
+git clone https://github.com/akshay-kumar-bm/omnigate.git
+cd omnigate
+npm install --legacy-peer-deps
+npx wrangler login
+```
+
+> `--legacy-peer-deps` is required. Dependencies are pinned on purpose; keep them pinned.
+
+### 2. Pick your server URL
+
+The Worker is named `infisical-mcp` in `wrangler.jsonc` (change `name` if you like), so it will live at:
+
+```
+https://infisical-mcp.<your-subdomain>.workers.dev
+```
+
+Find `<your-subdomain>` in the Cloudflare dashboard under **Workers & Pages**. This full URL is your **`PUBLIC_URL`**.
+
+### 3. Create the storage Cloudflare needs
+
+```bash
+npx wrangler kv namespace create OAUTH_KV
+```
+
+Copy the `id` it prints. Approvals and sign-in sessions use a Durable Object, which `wrangler.jsonc` already declares; nothing to create.
+
+### 4. Set up Infisical (your vault)
+
+1. Create a **project** in Infisical. Copy its **Project ID** (Project settings).
+2. Create a **Machine Identity** with **Universal Auth** (Organization → Access Control → Identities).
+3. Create a **Client Secret** for it. Copy the **Client ID** and **Client Secret**.
+4. Add the identity to your project with a role that can **read** secrets. Omnigate never writes secrets, so read access is enough.
+5. Note the environment you'll use (default: `dev`).
+
+### 5. Set up Google sign-in
+
+1. In [Google Cloud Console](https://console.cloud.google.com) → **APIs & Services** → **OAuth consent screen**: choose External, fill in the app name, and add your email as a test user.
+2. **Credentials** → **Create credentials** → **OAuth client ID** → type **Web application**.
+3. Under **Authorized redirect URIs** add `<PUBLIC_URL>/callback`.
+4. Copy the **Client ID** and **Client Secret**.
+
+### 6. Fill in the config
+
+`wrangler.jsonc` uses `${NAME}` placeholders for account-specific values:
+
+| Placeholder | What it is |
+|---|---|
+| `OAUTH_KV_ID` | KV namespace id from step 3 |
+| `INFISICAL_PROJECT_ID` | Project ID from step 4 |
+| `AGENT_PROJECT_ID` | Separate Infisical project for `issue_temp_token` (optional; see [below](#temporary-cli-tokens-issue_temp_token)) |
+| `R2_ACCOUNT_ID` | Your Cloudflare account ID, for `get_upload_url` (optional) |
+| `ALLOWED_EMAILS` | Comma-separated Google accounts allowed to sign in |
+| `PUBLIC_URL` | Your Worker URL from step 2 |
+
+Also set `INFISICAL_HOST` to `https://eu.infisical.com` if your Infisical is on EU cloud.
+
+- **Deploying with GitHub Actions (recommended):** keep the placeholders in the file and add each value as a repository **variable** (Settings → Secrets and variables → Actions → Variables). The workflow fills them in before deploying and stops if one is missing.
+- **Deploying by hand:** replace the placeholders in your local copy and don't commit it.
+
+### 7. Store the server's own secrets
+
+Each command asks you to paste the value:
+
+```bash
+npx wrangler secret put INFISICAL_CLIENT_ID
+npx wrangler secret put INFISICAL_CLIENT_SECRET
+npx wrangler secret put GOOGLE_CLIENT_ID
+npx wrangler secret put GOOGLE_CLIENT_SECRET
+```
+
+These live on the Worker. Deploys never touch them.
+
+### 8. Deploy
+
+**From GitHub:** `.github/workflows/deploy.yml` deploys on every push to `main` (or by hand: Actions → Deploy → Run workflow). Add the repository **secrets** `CLOUDFLARE_API_TOKEN` (a token with "Edit Cloudflare Workers" permission) and `CLOUDFLARE_ACCOUNT_ID`, plus the variables from step 6.
+
+**By hand:**
+
+```bash
+npx wrangler deploy
+```
+
+### 9. Check it works
+
+```bash
+curl https://infisical-mcp.<your-subdomain>.workers.dev/.well-known/oauth-authorization-server
+# 200 with JSON  -> the server is up
+
+curl -i https://infisical-mcp.<your-subdomain>.workers.dev/mcp
+# 401 Unauthorized -> correct, you haven't signed in yet
+```
+
+---
+
+## Connect it to Claude
+
+Your MCP endpoint is `<PUBLIC_URL>/mcp`.
+
+### claude.ai and Claude Desktop
+
+1. **Settings** → **Connectors** → **Add custom connector**
+2. Name: `Omnigate`. URL: your `/mcp` endpoint.
+3. Click **Connect** and sign in with a Google account listed in `ALLOWED_EMAILS`.
+4. Enable the connector in a chat (the tools menu) and start asking.
+
+### Claude Code
+
+```bash
+claude mcp add --transport http omnigate https://infisical-mcp.<your-subdomain>.workers.dev/mcp
+```
+
+Then run `/mcp` inside Claude Code and choose **Authenticate** to sign in with Google.
+
+### Other MCP clients
+
+Any client that supports **remote MCP over HTTP with OAuth** works. Point it at the `/mcp` URL; it discovers the sign-in flow automatically.
+
+---
+
+## Add your API tokens
+
+Every token needs two things: a **name** (how Claude refers to it) and **hosts** (where it may be sent). You add them in the Infisical dashboard, so the token never touches the chat.
+
+1. Open your Infisical project → environment `dev`.
+2. Create a **folder per service**, e.g. `/github`, `/notion`, `/linear`.
+3. Add the secret inside it, e.g. name `GITHUB_TOKEN`, value `ghp_...`.
+4. In the secret's **comment**, add a hosts line:
+   ```
+   hosts: api.github.com, uploads.github.com
+   ```
+5. Done. Ask Claude "list my secrets" to confirm it shows the hosts. No redeploy.
+
+### Rules for the comment
+
+- `hosts:` takes bare hostnames only: `api.example.com` (no `https://`, path, port, IP or internal domain).
+- Wildcards cover subdomains: `*.atlassian.net` matches `yourteam.atlassian.net`, but never the bare `atlassian.net`.
+- Wildcards on shared-hosting domains (`*.workers.dev`, `*.github.io`, `*.vercel.app`, `*.amazonaws.com`, ...) are refused, because anyone can register a subdomain there. Name the exact host instead.
+- A secret with no `hosts:` line is **never sent anywhere**. Use that for IDs and config values.
+- Optional approval rules (`approve: writes`, `approve: all`, `allow: ...`) go in the same comment; see [Approvals](#approvals-for-risky-actions).
+
+### Common services
+
+| Service | Suggested name | `hosts:` line | Auth |
+|---|---|---|---|
+| GitHub | `GITHUB_TOKEN` | `api.github.com, uploads.github.com` | `bearer` (default) |
+| Notion | `NOTION_TOKEN` | `api.notion.com` | `bearer` + header `Notion-Version: 2022-06-28` |
+| Linear | `LINEAR_API_TOKEN` | `api.linear.app` | `header`, `header_name: Authorization` |
+| Stripe | `STRIPE_SECRET_KEY` | `api.stripe.com` | `bearer` |
+| Slack | `SLACK_BOT_TOKEN` | `slack.com` | `bearer` |
+| OpenAI | `OPENAI_API_KEY` | `api.openai.com` | `bearer` |
+| Jira / Confluence | `JIRA_TOKEN` (value `email:api_token`) | `*.atlassian.net` | `basic` |
+| Google | `GOOGLE_OAUTH` (JSON, see below) | `*.googleapis.com` | `oauth2_refresh` |
+| AWS | `AWS_ADMIN` (JSON, see below) | per region, e.g. `sts.ap-south-1.amazonaws.com, *.ap-south-1.amazonaws.com` | `aws` |
+
+> Use the narrowest token you can: read-only scopes, one repo, one workspace. The host lock limits *where* a token goes; the token's own scopes limit *what* it can do.
+
+### Google and other OAuth APIs
+
+Google and Microsoft need a short-lived access token instead of a fixed key. Store one secret whose value is JSON; the server trades the refresh token for an access token (cached until a minute before it expires):
+
 ```
 name:    GOOGLE_OAUTH            (folder /google)
 value:   {"client_id":"...","client_secret":"...","refresh_token":"...","token_url":"https://oauth2.googleapis.com/token"}
 comment: hosts: *.googleapis.com
 ```
-`token_url`'s host must also be in the `hosts:` line (for Microsoft: `hosts: graph.microsoft.com, login.microsoftonline.com`), so the refresh token only goes where you allowed. Optional `scope` is sent with the refresh (Microsoft wants it). Providers that invalidate the old refresh token on every refresh are not supported, because this server never writes secrets.
-Google one-time setup: Google Cloud Console → enable the APIs (Gmail, Drive, Calendar, ...) → OAuth consent screen, publishing status **In production** (unverified is fine for your own account; in Testing mode Google expires refresh tokens after 7 days) → Clients → new OAuth client of type **Web application** (not the Worker's sign-in client) with the redirect URI `https://developers.google.com/oauthplayground` → in [OAuth Playground](https://developers.google.com/oauthplayground), gear icon → "Use your own OAuth credentials", enter the scopes you want (space-separated), authorize, then "Exchange authorization code for tokens" → put the refresh token in the JSON and paste it into Infisical. One token covers every API whose scope you granted; adding a scope later means a new refresh token.
 
-**AWS: `aws`.** Store one secret per AWS identity whose value is JSON; the Worker signs every request (SigV4) and the key never leaves it:
+`token_url`'s host must also be allowed (for Microsoft: `hosts: graph.microsoft.com, login.microsoftonline.com`, plus an optional `scope`). Providers that replace the refresh token on every refresh aren't supported, because Omnigate never writes secrets.
+
+**Getting a Google refresh token:** Google Cloud Console → enable the APIs you want (Gmail, Drive, Calendar, ...) → OAuth consent screen set to **In production** (unverified is fine for your own account; in Testing mode refresh tokens expire after 7 days) → create a **Web application** OAuth client (separate from the sign-in client) with redirect URI `https://developers.google.com/oauthplayground` → in [OAuth Playground](https://developers.google.com/oauthplayground), gear icon → "Use your own OAuth credentials", enter your scopes, authorize, exchange the code for tokens → put the refresh token in the JSON.
+
+Recommended scopes: `gmail.modify` rather than full `https://mail.google.com/` (no permanent delete, filters or forwarding), `calendar.events` rather than `calendar`, plus `drive`, `documents`, `spreadsheets` as needed.
+
+### AWS
+
+Store one secret per AWS identity, value as JSON. The server signs every request with SigV4 and the key never leaves it:
+
 ```
 name:    AWS_ADMIN               (folder /aws)
 value:   {"access_key_id":"AKIA...","secret_access_key":"...","region":"ap-south-1","role_arn":"arn:aws:iam::123456789012:role/agent"}
@@ -36,167 +305,291 @@ comment: hosts: sts.ap-south-1.amazonaws.com, *.ap-south-1.amazonaws.com
          approve: writes
          allow: aws dynamodb:PutItem
 ```
-- `role_arn` is optional but recommended: the stored keys are then only used for `sts:AssumeRole`, and requests are signed with 15-minute role credentials, so the role's IAM policy caps what any request can do. Optional `external_id`, `session_seconds`, `session_token`.
-- `*.amazonaws.com` is refused as a wildcard (anyone can create an S3 bucket under it); name hosts per region as above, plus `iam.amazonaws.com` if you use IAM.
-- AWS approvals are decided by the **action**, not the HTTP method (most AWS reads are POSTs): `Describe*`/`Get*`/`List*`/`Query`/`Scan`/S3 `GET` are reads; `Delete*`, `Terminate*`, `Stop*`, `Remove*`, `Revoke*`, ..., every IAM/Organizations/KMS change, policy changes, `ssm:SendCommand`/`StartSession` and `iam:CreateAccessKey` always need approval; anything else is a write (needs approval with `approve: writes` unless an `allow: aws service:Action` line covers it; `*` works inside the action, e.g. `allow: aws s3:Put*`). See `src/aws.ts`.
-- Reads that return secrets (`secretsmanager:GetSecretValue`, SSM `SecureString` parameters, `sts:AssumeRole`, `kms:Decrypt`, `ecr:GetAuthorizationToken`, ...) run, but the secret fields go into the **session vault** and the response shows `vault:<name>` instead.
-- `api_request` with an AWS secret: pass the endpoint URL (`https://dynamodb.ap-south-1.amazonaws.com/`), headers and body as the API expects; `aws_service`/`aws_region` only if the host doesn't make them clear. For several calls use `run_code`'s `aws.call`.
 
-**Session vault (`capture`).** Values a call returns that the model must not see, such as an API key an admin call just created, can be kept server-side: `api_request { ..., capture: { newkey: "$.key" } }` stores the value for 60 minutes (`capture_minutes`, max 24 h) and the response shows `vault:newkey`. Later calls use `secret: "vault:newkey"` or `{{vault:newkey}}` in a header, URL or body; the server substitutes it right before sending and redacts it. A vault value may only go to the hosts of the secret that produced it; sending it anywhere else needs an approval naming that host.
+- `role_arn` is optional but recommended: the stored keys are then used only for `sts:AssumeRole`, and requests are signed with 15-minute role credentials, so the role's IAM policy caps what any request can do. Optional `external_id`, `session_seconds`, `session_token`.
+- Add `iam.amazonaws.com` to `hosts:` if you use IAM.
+- AWS approvals follow the **action**, not the HTTP method: `Describe*`, `Get*`, `List*`, `Query`, `Scan` and S3 `GET` are reads; `Delete*`, `Terminate*`, `Stop*`, `Revoke*`, IAM/KMS/Organizations changes, `ssm:SendCommand` and `iam:CreateAccessKey` always need approval. See `src/aws.ts`.
+- Responses that contain secrets (`secretsmanager:GetSecretValue`, SSM `SecureString`, `sts:AssumeRole`, `kms:Decrypt`, ...) go into the [session vault](#session-vault) instead of to Claude.
 
-**`approve: all`** (for production secrets): every call with the secret, reads included, needs approval.
+---
 
-**File uploads.** `multipart` sends a `multipart/form-data` form with files; `body_base64` sends raw bytes. Both take base64 data, up to 5 MB decoded per request, and cannot be combined with `body`. Example, uploading an image to a Notion row (the same two calls the Notion docs describe):
+## Using it
+
+Just talk to Claude. Some things to try:
+
+- "What secrets do I have stored?"
+- "Show my GitHub notifications from today."
+- "Create a Linear issue titled 'Fix login bug' in the Web team."
+- "Find the Notion page called Roadmap and add a bullet: Ship v2 in March."
+- "Summarise my unread Gmail and draft replies."
+- "Who am I on AWS, and what's in the `users` DynamoDB table?"
+
+Under the hood Claude makes calls like:
+
+```text
+api_request { url: "https://api.github.com/user", secret: "GITHUB_TOKEN" }
+
+api_request { url: "https://api.notion.com/v1/users/me", secret: "NOTION_TOKEN",
+              headers: { "Notion-Version": "2022-06-28" } }
+
+api_request { url: "https://api.linear.app/graphql", method: "POST", secret: "LINEAR_API_TOKEN",
+              auth_type: "header", header_name: "Authorization",
+              body: { query: "{ viewer { name } }" } }
+
+api_request { url: "https://gmail.googleapis.com/gmail/v1/users/me/messages", secret: "GOOGLE_OAUTH" }
 ```
-1. api_request { url: "https://api.notion.com/v1/file_uploads", method: "POST", secret: "NOTION_TOKEN", headers: { "Notion-Version": "2022-06-28" }, body: { filename: "card.png", content_type: "image/png" } }          -> id
-2. api_request { url: "https://api.notion.com/v1/file_uploads/<id>/send", method: "POST", secret: "NOTION_TOKEN", headers: { "Notion-Version": "2022-06-28" }, multipart: { files: [{ filename: "card.png", content_type: "image/png", data_base64: "<...>" }] } }
-3. api_request { url: "https://api.notion.com/v1/pages/<page>", method: "PATCH", secret: "NOTION_TOKEN", headers: { "Notion-Version": "2022-06-28" }, body: { properties: { Image: { files: [{ name: "card.png", type: "file_upload", file_upload: { id: "<id>" } }] } } } }
+
+**Uploading a file** (up to 5 MB) works with `multipart` or `body_base64`. For example, attaching an image to a Notion page takes three calls: create a file upload, send the bytes with `multipart`, then reference the upload id on the page. For bigger files see [Big files](#big-files-and-binary-output).
+
+**Secrets in several folders:** `api_request` finds a secret by name in any folder. If the same name exists in two folders, it refuses to guess and asks for `path` (e.g. `path: "/github"`).
+
+### Session vault
+
+Some calls return values the model shouldn't see, such as an API key an admin call just created. Pass `capture` and the server keeps them:
+
+```text
+api_request { ..., capture: { newkey: "$.key" } }   → the response shows vault:newkey
 ```
 
-**Safety rules**
-- A secret can only be sent to the hosts in **its own comment**, a line like `hosts: api.example.com, *.example.com`. There is no built-in list and no config var: no `hosts:` line means the secret is never sent anywhere (fine for IDs and config).
-  - Only the owner writes that line, in the Infisical dashboard; no tool can create or edit a secret, so a tricked model can't point a token at another site. It shows as `hosts` in `list_secrets`.
-  - Hosts must be bare hostnames (no scheme, path, port, IP or internal domain). Wildcards need two labels (`*.example.com`, matches any subdomain depth, never the bare domain) and are refused on shared-hosting domains such as `*.workers.dev` or `*.github.io`.
-  - To connect a new service: add the token in Infisical, in its own folder (e.g. `/linear`), with the comment `hosts: api.linear.app`. No redeploy.
-- Secret references (`${OTHER}`) are not expanded when `api_request` reads a value, so a secret can't be used to leak another secret.
-- HTTPS only, default port only, redirects are not followed, 3-minute timeout, response body capped at 60 KB, uploads capped at 5 MB, secrets redacted from the body and headers. The client may not set its own `Authorization` header.
-- Secrets are read from `DEFAULT_ENVIRONMENT` (`dev`) unless `environment` is passed. Keep one Infisical folder per service (`/notion`, `/github`, ...): `api_request` finds a secret by name in any folder, refuses to guess if the same name is in several (pass `path`), and `list_secrets` searches all folders by default.
-- `api_request` and `run_code` are not a shell. For CLIs and SDKs on the agent's own machine use `open_gateway` (below); only as a last resort `infisical run --env=dev -- <cmd>` with a token from `issue_temp_token`.
-  - With a token from `issue_temp_token`: `infisical run --token="$INFISICAL_TOKEN" --domain=https://us.infisical.com --projectId=<id> --env=dev --path=/github -- gh api user`. Use the real command after `--`, not another `infisical run`.
-  - To clone with the injected token use `git` (e.g. `-c http.extraheader=...`), not `gh repo clone`: that uses GraphQL, which Claude Code sessions can't call.
+Later calls use `secret: "vault:newkey"`, or the handle inside double curly braces in a header, URL or body; the server substitutes it right before sending and redacts it. Values last 60 minutes by default (`capture_minutes`, max 24 h). A vault value may only go to the hosts of the secret that produced it; sending it elsewhere needs an approval.
+
+---
 
 ## Multi-step work: `run_code`
-The assistant writes JavaScript (the body of an async function) and the server runs it in an isolated sandbox with no network and no secrets: on the **free plan** in **QuickJS** (a small JavaScript engine compiled to WebAssembly, inside the Worker; `src/quick-run.ts`), on the paid plan in a fresh **Cloudflare Dynamic Worker** per run. The engine is picked automatically: the `LOADER` binding present means Dynamic Workers. The only way out is a set of helpers that run back in this Worker through the same checks as `api_request` (hosts, approvals, redaction, vault):
+
+For anything that takes more than one call, Claude writes JavaScript and the server runs it in an isolated sandbox with **no network and no secrets**. The only way out is a set of helpers that run through the same checks as `api_request` (hosts, approvals, redaction, vault):
+
 ```js
-// run_code { purpose: "check user 1 and the app log", secrets: ["AWS_ADMIN", "GH_TOKEN"], code: `...` }
+// run_code { purpose: "check user 1 and my repos", secrets: ["AWS_ADMIN", "GITHUB_TOKEN"], code: `...` }
 const [item, repos] = await Promise.all([
-  aws.call("AWS_ADMIN", { service: "dynamodb", action: "GetItem", params: { TableName: "users", Key: { id: { S: "1" } } } }),
-  api.get("GH_TOKEN", "https://api.github.com/user/repos"),
+  aws.call("AWS_ADMIN", { service: "dynamodb", action: "GetItem",
+    params: { TableName: "users", Key: { id: { S: "1" } } } }),
+  api.get("GITHUB_TOKEN", "https://api.github.com/user/repos", { pick: ["$[*].full_name"] }),
 ]);
-const obj = await aws.request("AWS_ADMIN", { service: "s3", method: "GET", path: "/my-bucket/config.json" });
-const cmd = await aws.call("AWS_ADMIN", { service: "ssm", action: "SendCommand",      // asks for approval
-  params: { InstanceIds: ["i-0abc"], DocumentName: "AWS-RunShellScript", Parameters: { commands: ["tail -n 200 /var/log/app.log"] } } });
-await sleep(3000);
-const out = await aws.call("AWS_ADMIN", { service: "ssm", action: "GetCommandInvocation", params: { CommandId: cmd.body.Command.CommandId, InstanceId: "i-0abc" } });
-return { user: item.body.Item, repos: repos.body.length, config: obj.body, log: out.body.StandardOutputContent };
+return { user: item.body.Item, repos: repos.body.map(r => r.full_name) };
 ```
-- Helpers: `api.get/post/put/patch/delete/request` (same arguments as `api_request`), `aws.call` (JSON and query AWS APIs; XML is parsed), `aws.request` (REST AWS APIs such as S3, path-style), `vault.list/delete`, `sleep`, `input`, `console.log`. Only the return value and logs come back (100 KB), so filter big data in code.
-- **Approvals pause the run.** A call that needs approval stops the run and returns `approval_required`; after the user approves, the assistant repeats `run_code` with the same code plus `approval_id`. Finished calls are replayed from a journal (Durable Object, 1 h), not repeated, and the approved call goes out. Changed code or arguments are refused.
-- `secrets` lists what the code may use. Limits: 300 calls per run, 6 in flight, 120 s wall time by default (max 600).
-- **Free plan request budget.** Cloudflare allows 50 outbound requests per invocation on the free plan. Within a run each secret is read from Infisical once (not per call), so a call costs about one outbound request, and a segment makes up to 35 live calls (`RUN_CODE_CALL_BUDGET`). The server then **continues by itself**: each segment runs as a fresh invocation of the Worker (the `RunSegment` entrypoint via `ctx.exports`) and resumes the same run from its journal, up to 8 segments (~280 calls) or ~50 s per tool call. Only after that does the tool return a **checkpoint** (`checkpoint: true`, `run_id`); the assistant then calls `run_code` with ONLY `resume_run_id` (never resending code, purpose or input) until `ok: true`. Finished calls are replayed, never repeated. If the platform limit is hit anyway, that also becomes a checkpoint.
-- **Big responses.** Inside `run_code`, a response over 60 KB (or `max_bytes`, up to 500 KB) comes back with `truncated: true`, `original_bytes`/`returned_bytes`, `body: null` plus `body_text` when it was JSON (never a cut-off string that won't parse), a `sample` of the full response's shape (keys, types, array lengths, first item; ~2 KB, redacted) and a hint; a log line says what was cut. Pass `pick: ["$.results[*].id", "$.has_more"]` to get only those fields, in their original nesting. A return value over 100 KB comes back as `truncated: true` with a `sample` instead of failing. (`api_request` itself is unchanged.)
-- **Resume with ids only.** The server keeps each run's code, secrets, purpose and input for 1 hour, so continuing after an approval, a checkpoint or a failure is just `run_code({resume_run_id, approval_id?})`. Code sent along must match the stored copy; approvals stay bound to the stored program and the exact call.
-- **Failures keep finished work.** A failed run returns `completed_calls` and `run_id`; after fixing the cause (e.g. renewing an expired key), resuming retries only the calls that got an error status (only after a failed run; continuing from a checkpoint replays them).
-- **Free plan (QuickJS):** Cloudflare gives a free Worker about 10 ms of CPU per request, so code should orchestrate calls and filter results, not compute heavily; a runaway loop is stopped after a fixed number of steps (`RUN_CODE_MAX_STEPS` var, default 200, about 8 ms) with a clear error. Waiting for APIs costs no CPU. No `fetch`, `setTimeout` or Node APIs inside; use the helpers.
-- **Dynamic Workers:** uncomment the `LOADER` Worker Loader binding in `wrangler.jsonc` and deploy; same helpers, real V8 (much faster than QuickJS within the same CPU limit). Cloudflare's pricing page lists them for Workers Paid; if they turn out not to run on your plan, `run_code` falls back to QuickJS by itself (calls that already ran are replayed, not repeated) and the result says `engine`. If Cloudflare refuses the deploy because of the binding, the previous version keeps running: comment the line out again. Optional var `RUN_CODE_CPU_MS` sets a lower CPU limit per run.
+
+- **Helpers:** `api.get/post/put/patch/delete/request` (same arguments as `api_request`), `aws.call` (JSON and query AWS APIs; XML is parsed), `aws.request` (REST AWS APIs such as S3), `vault.list/delete`, `sleep`, `input`, `console.log`. Only the return value and logs come back (up to 100 KB), so Claude filters big data on the server.
+- **Engines:** on the free plan the code runs in **QuickJS** (compiled to WebAssembly inside the Worker). With a Workers Paid plan, uncomment the `LOADER` binding in `wrangler.jsonc` to run each job in a fresh **Dynamic Worker** (real V8, much faster). If that doesn't work on your plan, `run_code` falls back to QuickJS by itself.
+- **Big responses:** a response over 60 KB comes back with `truncated: true`, a `sample` of its shape (keys, types, array lengths, first item) and a hint. Pass `pick: ["$.results[*].id", "$.has_more"]` to fetch only those fields.
+- **Approvals pause the run.** A call that needs approval stops the run with an approval link. After you approve, Claude resumes with just the `run_id`; finished calls are replayed from a journal, never repeated, and the approval is bound to that exact call.
+- **Free-plan limits handled for you:** Cloudflare allows 50 outbound requests per invocation, so the server splits long runs into segments and continues by itself (up to ~280 calls per tool call). Beyond that it returns a checkpoint and Claude resumes it by id.
+- **Failures keep finished work:** a failed run keeps its completed calls for an hour; after fixing the cause, resuming retries only the failed calls.
+- Limits: 300 calls per run, 6 in flight, 120 s wall time by default (max 600), about 10 ms of CPU on the free plan, so code should orchestrate and filter rather than compute.
+
+---
 
 ## Agents with a shell: `open_gateway`
-For Claude Code and cloud sessions that want curl, an SDK or the real **`aws` CLI**, with nothing to install and no real credential in the sandbox. `open_gateway { secrets: ["AWS_ADMIN", "GH_TOKEN"], minutes: 30, purpose: "..." }` always needs approval (with a tick box) and returns a **gateway token** plus lines to run:
+
+For Claude Code and cloud sessions that want `curl`, an SDK or the real **`aws` CLI**, with nothing to install and no real credential in the sandbox. `open_gateway { secrets: ["AWS_ADMIN", "GITHUB_TOKEN"], minutes: 30, purpose: "..." }` always needs approval (with a tick box) and returns a **gateway token** plus lines to run:
+
 ```bash
 export GATEWAY_TOKEN='gwt_...'
-curl -sS -H "Authorization: Bearer $GATEWAY_TOKEN" https://infisical-mcp.shipengine-ai.workers.dev/gw/GH_TOKEN/api.github.com/user
+curl -sS -H "Authorization: Bearer $GATEWAY_TOKEN" <PUBLIC_URL>/gw/GITHUB_TOKEN/api.github.com/user
+
 export AWS_ACCESS_KEY_ID=GW... AWS_SECRET_ACCESS_KEY=gateway-dummy-key AWS_SESSION_TOKEN="$GATEWAY_TOKEN"
-export AWS_ENDPOINT_URL=https://infisical-mcp.shipengine-ai.workers.dev AWS_REGION=ap-south-1 AWS_DEFAULT_REGION=ap-south-1
-aws configure set default.s3.addressing_style path
+export AWS_ENDPOINT_URL=<PUBLIC_URL> AWS_REGION=ap-south-1
 aws dynamodb get-item --table-name users --key '{"id":{"S":"1"}}'
 ```
-- HTTP: `https://<worker>/gw/<SECRET>/<api-host>/<path>`, gateway token where the API key would go (`Authorization: Bearer`/`Basic`, `x-api-key` or `x-gateway-token`); other auth styles via `x-gateway-auth: header|query|basic` and `x-gateway-header-name` etc.
-- AWS: the CLI signs with a dummy key; the Worker checks the gateway token (sent as `X-Amz-Security-Token`), takes service and region from the signature, maps them to the real endpoint and signs again with the real (or AssumeRole) credentials. Works with the AWS CLI, boto3 and the other SDKs. Newer CLIs' chunked S3 uploads are decoded.
-- Same policy as `api_request`. A request that needs approval fails with a message containing the link; after the user approves, **re-running the identical command** goes through (the approval is bound to the session and the request, once, 15 minutes).
-- The token is a gateway credential: only for this server, only the listed secrets, at most 60 minutes. Cloud sessions need the Worker's host in their environment's allowed hosts.
-- Not through the gateway: commands that sign locally (`aws s3 presign`, `aws eks get-token`, `aws rds generate-db-auth-token`) and interactive `aws ssm start-session`. Read logs with `ssm send-command` (with approval) instead of SSH.
 
-## Approval for destructive actions
-These always need a human, enforced by the server (not by the model):
-- `api_request` that is destructive: method `DELETE`; a GraphQL mutation whose field names contain delete/destroy/remove/archive/purge/trash (e.g. Linear `issueDelete`); a JSON body that sets `archived`/`trashed`/`deleted`/`in_trash` to `true` (how Notion and GitHub archive); a URL whose last part is a trash/delete action (`/trash`, `/delete`, `/batchDelete`, `/emptyTrash`, `:delete`, e.g. Gmail `POST .../messages/{id}/trash`); or Gmail send (`.../messages/send`, `.../drafts/send`), which can't be undone.
+- **HTTP:** `<PUBLIC_URL>/gw/<SECRET>/<api-host>/<path>`, with the gateway token where the API key would go.
+- **AWS:** the CLI signs with a dummy key; the server checks the gateway token, then signs again with the real (or AssumeRole) credentials. Works with the AWS CLI, boto3 and the other SDKs.
+- Same rules as `api_request`. A request that needs approval fails with a link; after you approve, re-running the identical command goes through.
+- The gateway token only works on this server, only for the listed secrets, for at most 60 minutes.
+- Not supported: commands that sign locally (`aws s3 presign`, `aws eks get-token`) and interactive `aws ssm start-session`.
 
-Everything else (reads, creates, other writes) runs automatically, unless the secret is in strict mode (next section).
+---
 
-**Strict mode: approve every write (`approve: writes`).** Pattern detection can never list every way an API can lose data (a Docs `batchUpdate` delete, a Gmail `TRASH` label, a filter, sharing a Drive file, clearing a sheet, a batch request with a DELETE inside). For a powerful credential, turn the rule around in the secret's own comment, which only the owner writes:
+## Approvals for risky actions
+
+Some actions need a human, and the **server** enforces it, not the model.
+
+**Always need approval:**
+
+- `api_request` / `run_code` / gateway calls that look destructive:
+  - method `DELETE`
+  - GraphQL mutations whose names contain delete / destroy / remove / archive / purge / trash (e.g. Linear `issueDelete`)
+  - JSON bodies that set `archived`, `trashed`, `deleted` or `in_trash` to `true` (how Notion and GitHub archive)
+  - URLs ending in a trash/delete action (`/trash`, `/delete`, `/batchDelete`, `/emptyTrash`, `:delete`)
+  - Gmail send (`messages/send`, `drafts/send`), which can't be undone
+  - destructive AWS actions (see [AWS](#aws))
+- `open_gateway` and `issue_temp_token`, every time
+
+Everything else (reads, creates, ordinary updates) runs right away, unless you turn on strict mode.
+
+**Strict mode for powerful credentials.** Pattern detection can't know every way an API can lose data (a Docs `batchUpdate` delete, a Gmail label, sharing a Drive file). So for a powerful token, flip the rule in the secret's comment:
+
 ```
 hosts: *.googleapis.com
 approve: writes
 allow: POST gmail.googleapis.com/gmail/v1/users/me/drafts
 allow: POST sheets.googleapis.com/v4/spreadsheets/<sheet id>/values/*:append
 ```
-- `approve: writes`: every `POST`/`PUT`/`PATCH`/`DELETE` with this secret needs approval, whatever the URL or body. Reads (`GET`/`HEAD`) don't. Any `approve:` line turns it on, so a typo fails closed.
-- `allow: METHOD host/path`: the only writes that run without approval. `METHOD` is `POST`, `PUT` or `PATCH`; the host is exact (no wildcards); the whole path must match, and `*` matches within one path segment only, so `values/*:append` covers append but not `:clear`, another sheet, or a batch endpoint. Query strings are not checked, so think about them (e.g. Calendar `sendUpdates=all` emails attendees). A path with an encoded `/` never matches. Invalid lines are ignored. An allow line never waives the approval for `DELETE` or the destructive patterns above.
-- `list_secrets` shows `approval: "writes"` and the `allow` list, so the model knows in advance and can prefer an allowed action (draft instead of send).
 
-**What the approval page shows.** A plain-language summary line first (e.g. "Create Google Sheet "Email Summaries" with 31 rows × 7 columns", "Append 3 rows × 2 columns to Sheet1!A1", "Create Notion page "Weekly report" in database …", or method + host + path with the number of items), a preview table of the first 10 records when the body holds a list (Sheets `rowData`/`values`, or any array of objects), then the method, host and decoded path, the query and why approval is needed, and the full body (compact, up to 200 KB) in a collapsed section. The page has no script. The model is told the same summary line, not the body. For Gmail send the base64 message is decoded into From / To / Cc / **Bcc** / **Reply-To** / Subject / the first lines / attachment names (Bcc, Reply-To and attachments are highlighted, since they are how mail is quietly copied or redirected). `drafts/send` carries only a draft id, so the server reads that draft's headers first and shows them.
+- `approve: writes`: every `POST`/`PUT`/`PATCH`/`DELETE` with this secret needs approval. Reads don't.
+- `approve: all`: every call, reads included (for production secrets).
+- `allow: METHOD host/path`: the only writes that skip approval. Exact host, whole path, `*` matches within one path segment. An allow line never waives approval for `DELETE` or the destructive patterns above.
+- `list_secrets` shows these rules, so Claude can prefer an allowed action (a draft instead of a send).
 
-**Recommended Google setup** (defence in depth: Google refuses what the scope doesn't allow, the server asks for the rest):
-- Scopes: `gmail.modify` instead of `https://mail.google.com/` (no permanent delete, no filters or forwarding), `calendar.events` instead of `calendar` (no deleting or re-sharing calendars), plus `drive`, `documents`, `spreadsheets`.
-- The secret comment above: drafts and appending to one sheet run unattended; sending, trashing, labels, edits, sharing and invites wait for a click.
-- Scheduled agents should read and draft; you send.
-- Not covered: an agent that reads your mail and leaks it through its own shell (`curl` in Claude Code). Run mail automations without a shell or with network access restricted.
+**What you see:**
 
-1. The first call returns `approval_required` with an `approve_url` and does nothing.
-2. The user opens the link. The first time, it goes straight to Google sign-in (an account in `ALLOWED_EMAILS`); that leaves a 12-hour `HttpOnly` session cookie in their browser. After that, every approval link opens directly to a page showing the exact action with **Approve** and **Deny** buttons, so approving is one click. The page has a "Sign out of approvals" button. A model can't do this: it never has the cookie, and the confirm request needs both the cookie and a one-time nonce that was issued for that person and that approval.
-3. The model repeats the identical call with `approval_id`. The approval is bound to the exact tool and arguments (a different URL, name or body is refused), works once, and expires after 15 minutes.
+1. Claude says the action needs approval and gives you a link.
+2. You open it. The first time, you sign in with Google; that keeps you signed in for 12 hours, so later approvals are one click.
+3. The page explains the action in plain words ("Create Google Sheet 'Email Summaries' with 31 rows × 7 columns"), previews the first rows of any list in the body, and shows the method, host, path and full body. Gmail sends are decoded into From / To / Cc / **Bcc** / **Reply-To** / Subject / attachments, with the fields that can quietly copy or redirect mail highlighted.
+4. Press **Approve** or **Deny**, then tell Claude you approved. It repeats the identical call, which now runs.
 
-Approval records, sign-in sessions and one-time nonces live in a **Durable Object** (`ApprovalStore`), not Workers KV: KV is only eventually consistent, so an approval made in one region could still read as "pending" in another for up to a minute. A Durable Object reads its own writes everywhere, so a retry right after you click Approve sees it.
+An approval works **once**, only for **that exact action**, and expires after **15 minutes**. Claude can't approve for you: it never has your browser session.
 
-Limits: detection of non-`DELETE` destructive API calls is best effort (`src/destructive.ts`). It reads GraphQL field names (aliases can't hide them; string literals and comments are ignored) and archive-style flags, but a destructive operation that uses other wording or a persisted query id is not recognised. Method-override headers are refused so they can't disguise a `DELETE`.
+---
 
-## Big files (`get_upload_url`)
-The assistant asks for an upload URL, runs one `curl -T <file> <url>` from its own machine (the file never passes through the chat), and gets a temporary download URL to give to other API calls. No approval step. The upload URL lasts 5 minutes and signs `If-None-Match: *`, so R2 accepts only the first write; the download URL lasts 1 hour; a bucket lifecycle rule deletes objects under `tmp/` after 1 day. Until R2 is configured the tool returns the setup steps:
+## Big files and binary output
+
+**Uploading:** `get_upload_url` gives Claude a one-time upload URL (5 minutes, first write only). It runs one `curl -T <file> <url>` from its own machine and gets a download URL (1 hour) to hand to another API, e.g. as `api_request`'s `body_source` or a multipart file's `source` (up to 40 MB). The file never passes through the chat.
+
+**Saving output:** pass `save_response: true` to `api_request` and a successful response (audio, images, PDFs, exports) is stored and returned as a download URL instead of the body. For example, text-to-speech in one call:
+
+```json
+{ "url": "https://api.elevenlabs.io/v1/text-to-speech/<voice id>", "method": "POST",
+  "auth_type": "header", "header_name": "xi-api-key", "secret": "ELEVENLABS_API_KEY",
+  "body": { "text": "Hello", "model_id": "eleven_multilingual_v2" }, "save_response": true }
 ```
+
+Files are deleted after 1 day. One-time setup with Cloudflare R2:
+
+```bash
 npx wrangler r2 bucket create <bucket>
 npx wrangler r2 bucket lifecycle add <bucket> --name expire-tmp --prefix tmp/ --expire-days 1
-# R2 > Manage API tokens > Object Read & Write on that bucket, then:
+# Cloudflare dashboard → R2 → Manage API tokens → Object Read & Write on that bucket, then:
 npx wrangler secret put R2_ACCESS_KEY_ID
 npx wrangler secret put R2_SECRET_ACCESS_KEY
-# and add R2_ACCOUNT_ID and R2_BUCKET as vars in wrangler.jsonc
 ```
-The uploading machine must be allowed to reach `<account id>.r2.cloudflarestorage.com`.
 
-To send the stored file somewhere, pass its download URL to `api_request` as `body_source` (raw body) or as a multipart file's `source` (e.g. Notion `POST /v1/file_uploads/{id}/send`). The Worker reads it from R2 itself, so the bytes never pass through the chat (max 40 MB). Only files stored by `get_upload_url` can be read this way.
+Then set `R2_ACCOUNT_ID` and `R2_BUCKET` in `wrangler.jsonc` and deploy again. Until this is done, `get_upload_url` replies with these steps.
 
-The other direction works too: pass `save_response: true` to `api_request` and a successful response body is written to the same bucket and returned as `saved.download_url` (1 hour, deleted after a day) instead of the body. Use it for binary output, e.g. text-to-speech in one call:
-```json
-{ "url": "https://api.elevenlabs.io/v1/text-to-speech/<voice id>", "method": "POST", "auth_type": "header", "header_name": "xi-api-key",
-  "secret": "ELEVENLABS_API_KEY", "body": { "text": "Hello", "model_id": "eleven_multilingual_v2" }, "save_response": true }
+---
+
+## Temporary CLI tokens: `issue_temp_token`
+
+A last resort for interactive CLIs that `open_gateway` can't cover. `issue_temp_token` gives Claude a short-lived Infisical token to use with `infisical run -- <command>`:
+
+- It uses a **separate, limited "agent" identity**, never the server's own.
+- Every request shows you the purpose, project, folder and lifetime. You must **tick a box** to give it.
+- The server refuses identities whose tokens live longer than 1 hour.
+
+Setup: create a second Machine Identity with a short token TTL (15–60 min) and a read-only role, then:
+
+```bash
+npx wrangler secret put AGENT_INFISICAL_CLIENT_ID
+npx wrangler secret put AGENT_INFISICAL_CLIENT_SECRET
 ```
-The file is named from the response's `Content-Disposition`, else `response.<ext>` from its `Content-Type` (e.g. `response.mp3`).
-Max 40 MB. Error statuses come back as text and are not saved. A response that contains the secret itself is refused rather than stored (binary can't be redacted). Storage is checked before the call, so a paid API is not charged for output that can't be kept. The saved file can be forwarded with `body_source`.
 
-## Temporary tokens for CLIs (`issue_temp_token`)
-For tools that need credentials in their own environment (the AWS CLI, terraform), `issue_temp_token` gives the assistant a short-lived Infisical token to use with `infisical run -- <command>`. **Every request needs a person**: the approval page shows the purpose, project, folder and the token's lifetime, and the approver must tick a "give token" box (enforced on the server). The token comes from a separate limited "agent" identity (Worker secrets `AGENT_INFISICAL_CLIENT_ID` / `AGENT_INFISICAL_CLIENT_SECRET`), never the server's own, and the server refuses to hand out one that lives longer than 1 hour. Not set up yet? The tool says so and returns the steps. Full guide (agent identity, AWS CLI, running the Agent Proxy server): [docs/agent-access.md](docs/agent-access.md).
+Set `AGENT_PROJECT_ID` to a separate small project so temp tokens can't reach your main vault. Full guide: [docs/agent-access.md](docs/agent-access.md).
 
-## Deploy
-Pushes to `main` deploy automatically via GitHub Actions (`.github/workflows/deploy.yml`; repo secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`). The steps below are the one-time setup and the manual route.
-1. `npm install --legacy-peer-deps`
-2. `npx wrangler login`
-3. `npx wrangler kv namespace create OAUTH_KV` -> put the id in `wrangler.jsonc`
-4. Infisical: create a Universal Auth Machine Identity, grant it access to the project (read/create/edit/delete secrets as you want). Put the project ID in `INFISICAL_PROJECT_ID`; use `https://eu.infisical.com` for `INFISICAL_HOST` if on EU cloud.
-5. Google Cloud Console -> APIs & Services -> Credentials -> OAuth client (Web). Authorized redirect URI: `https://<PUBLIC_URL host>/callback`.
-6. Set `PUBLIC_URL` (e.g. `https://infisical-mcp.<you>.workers.dev`) and `ALLOWED_EMAILS` in `wrangler.jsonc`.
-7. Secrets:
-   ```
-   npx wrangler secret put INFISICAL_CLIENT_ID
-   npx wrangler secret put INFISICAL_CLIENT_SECRET
-   npx wrangler secret put GOOGLE_CLIENT_ID
-   npx wrangler secret put GOOGLE_CLIENT_SECRET
-   ```
-8. `npx wrangler deploy`
-9. In Claude: Settings -> Connectors -> Add custom connector -> `https://<PUBLIC_URL host>/mcp`.
+---
 
-## Notes
-- Verified against Infisical docs: v4 list/get/delete secrets, v2 folders. v4 create/update and the environments lookup follow the same shape but were not checked live; test them first.
-- Local dev: `.dev.vars` with the four secrets, `PUBLIC_URL=http://localhost:8787`, `npx wrangler dev`.
+## Security model and limits
 
-## Deploying your own
+**What protects your tokens**
 
-`wrangler.jsonc` uses placeholders like `${OAUTH_KV_ID}` for account-specific values. The deploy workflow fills them in from GitHub Actions **variables** (Settings → Secrets and variables → Actions → Variables):
+- **Values never come back.** `list_secrets` never returns values, and every response has the token redacted from its body and headers.
+- **Read-only server.** No tool can create, edit or delete a secret, so the owner alone decides where each token may go.
+- **Host lock.** A token is only sent to the hosts in its own `hosts:` line.
+- **Sandboxed code.** `run_code` runs without network or secrets; every call goes back through the same checks.
+- **No redirects.** Redirects are never followed, since the next hop could be a host the token isn't allowed to reach.
+- **No secret-in-secret leaks.** `${OTHER_SECRET}` references are never expanded.
+- **No header tricks.** Claude can't set its own `Authorization` header, and method-override headers are refused, so a `DELETE` can't be disguised.
+- **Human approval** for deletes, sends, strict-mode writes, gateways and temp tokens.
+- **Sign-in allowlist.** Only `ALLOWED_EMAILS` can connect.
 
-| Variable | What it is |
+**Limits**
+
+- HTTPS only, default port only
+- 3-minute timeout per request
+- Responses capped at 60 KB (`run_code` adds samples and `pick` for bigger ones)
+- Uploads through `api_request` capped at 5 MB (40 MB via `get_upload_url`)
+- Detecting non-`DELETE` destructive calls is best effort (`src/destructive.ts`); use `approve: writes` for tokens where that matters.
+- Not covered: an agent that reads your data and leaks it through its own shell. Run sensitive automations without a shell or with network access restricted.
+
+---
+
+## Troubleshooting
+
+| Problem | Fix |
 |---|---|
-| `OAUTH_KV_ID` | ID of your Cloudflare KV namespace for OAuth state |
-| `INFISICAL_PROJECT_ID` | Infisical project holding your API secrets |
-| `AGENT_PROJECT_ID` | Infisical project used by the agent tools |
-| `R2_ACCOUNT_ID` | Cloudflare account ID that owns the R2 upload bucket |
-| `ALLOWED_EMAILS` | Comma-separated emails allowed to sign in |
-| `PUBLIC_URL` | Public URL of your deployed Worker |
+| **"Secret X is not allowed to be sent to &lt;host&gt;"** | The secret's `hosts:` line doesn't include that hostname. Edit the comment in Infisical. |
+| **"Secret X exists in several folders"** | Two secrets share the name. Pass `path`, or rename one. |
+| **Google says `redirect_uri_mismatch`** | The redirect URI in Google Cloud must be exactly `<PUBLIC_URL>/callback`. |
+| **"This Google account is not allowed."** | Your email isn't in `ALLOWED_EMAILS`. Add it and redeploy. |
+| **`/mcp` returns 401** | Expected before sign-in. Connect through Claude, which runs the sign-in flow. |
+| **Infisical errors (401/403)** | Check `INFISICAL_CLIENT_ID` / `INFISICAL_CLIENT_SECRET`, that the identity is added to the project, and that `INFISICAL_HOST` matches your region (US/EU). |
+| **Google refresh token stops working after a week** | Your OAuth consent screen is in Testing mode. Set it to In production and get a new refresh token. |
+| **Deploy workflow fails at "Fill in deployment config"** | A repository variable from [step 6](#6-fill-in-the-config) is missing. |
+| **`run_code` returns `checkpoint: true`** | Normal for long jobs. Claude resumes it with the `run_id`. |
+| **`get_upload_url` or `issue_temp_token` only return setup steps** | Their optional setup isn't done yet. See the sections above. |
+| **`npm install` fails** | Use `npm install --legacy-peer-deps`. |
 
-The workflow also needs the `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` **secrets**. For local `wrangler dev`, fill the placeholders in a local copy and don't commit it.
+---
+
+## Local development
+
+Create `.dev.vars` (git-ignored):
+
+```ini
+INFISICAL_CLIENT_ID=...
+INFISICAL_CLIENT_SECRET=...
+GOOGLE_CLIENT_ID=...
+GOOGLE_CLIENT_SECRET=...
+PUBLIC_URL=http://localhost:8787
+```
+
+Fill the `wrangler.jsonc` placeholders in your local copy (don't commit them), add `http://localhost:8787/callback` as a redirect URI in Google Cloud, then:
+
+```bash
+npm run dev         # wrangler dev on http://localhost:8787
+npm run typecheck   # run before every push
+```
+
+There's no test suite yet. Contributions are welcome.
+
+---
+
+## Project layout
+
+```
+src/
+  index.ts           entry point: OAuth provider (/mcp, /authorize, /token) and gateway routing
+  server.ts          MCP server and the six tools
+  api-call.ts        api_request: auth types, host check, uploads, redaction
+  api-schema.ts      api_request arguments, shared with run_code's api.request()
+  run-code.ts        run_code on Dynamic Workers (paid plan)
+  quick-run.ts       run_code on QuickJS (free plan)
+  quickjs-wasm.ts    loads the bundled QuickJS WebAssembly module
+  broker-rpc.ts      the only door from the sandbox back to the server
+  shape.ts           samples and `pick` for big run_code results
+  gateway.ts         open_gateway: /gw/ HTTP proxy and AWS CLI re-signing
+  aws.ts             AWS credentials, AssumeRole, endpoints, per-action classification
+  vault.ts           session vault for captured values
+  policy.ts          which calls need a human (one place for every way in)
+  destructive.ts     detects destructive requests beyond HTTP DELETE
+  preview.ts         plain-language approval summaries, Gmail decoding
+  approvals.ts       approval records and the /approve pages
+  approval-store.ts  Durable Object for approvals, sessions and nonces
+  store-core.ts      expiry logic for the store
+  hosts.ts           validation and parsing of the "hosts:" comment line
+  google-handler.ts  Google sign-in, consent page, /callback
+  infisical.ts       small Infisical REST client (Universal Auth, read-only)
+  uploads.ts         get_upload_url and saved responses (R2 presigned URLs)
+  temp-token.ts      issue_temp_token
+  guide.ts           setup and usage text for issue_temp_token
+docs/
+  design-credential-broker.md   design and threat model
+  agent-access.md               full guide for temporary CLI access
+wrangler.jsonc       Worker config (placeholders filled at deploy time)
+.github/workflows/deploy.yml    deploys on push to main
+```
+
+---
+
+## License
+
+MIT, see [LICENSE](LICENSE).
